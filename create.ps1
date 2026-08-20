@@ -1776,7 +1776,7 @@ function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
                 // Explicitly respect explicit readonly attribute only when explicitly true, avoiding blank-state coercion locking
                 const readonlyAttr = child.getAttribute('readonly');
                 const isReadonly = readonlyAttr === '1' || readonlyAttr === 'True' || fieldDef.readonly || (readonlyAttr ? evalModifier(readonlyAttr, record) : false);
-                const isRequired = child.getAttribute('required'] === '1' || fieldDef.required || evalModifier(child.getAttribute('required'), record);
+                const isRequired = child.getAttribute('required') === '1' || fieldDef.required || evalModifier(child.getAttribute('required'), record);
 
                 if (fieldDef.type === 6) {
                     return React.createElement(One2manyGrid, {
