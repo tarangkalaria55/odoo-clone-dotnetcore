@@ -25,11 +25,11 @@
                     </header>
                     <sheet>
                         <group string="Vendor Info">
-                            <field name="name" readonly="status != 'draft'"/>
-                            <field name="partner_id" readonly="status != 'draft'"/>
+                            <field name="name"/>
+                            <field name="partner_id"/>
                         </group>
                         <group string="Products">
-                            <field name="order_line" readonly="status != 'draft'"/>
+                            <field name="order_line"/>
                         </group>
                         <group string="Total">
                             <field name="amount_total"/>

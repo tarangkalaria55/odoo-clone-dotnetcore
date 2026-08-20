@@ -1,11 +1,10 @@
 $ErrorActionPreference = "Stop"
 
-Write-Host "==> Initializing Fixed Odoo .NET 10 Enterprise Suite..." -ForegroundColor Cyan
+Write-Host "==> Initializing Fully Editable Odoo .NET 10 Enterprise Suite..." -ForegroundColor Cyan
 
 # Clean previous solution if present
 if (Test-Path "OdooModularEnterpriseSuite.sln") { Remove-Item "OdooModularEnterpriseSuite.sln" -Force }
 
-# Explicitly create all required directories upfront
 New-Item -ItemType Directory -Force -Path `
     "Core.OdooEngine", `
     "HostApp/wwwroot", `
@@ -1774,8 +1773,10 @@ function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
                 const isInvisible = evalModifier(child.getAttribute('invisible'), record);
                 if (isInvisible) return null;
 
-                const isReadonly = child.getAttribute('readonly') === '1' || fieldDef.readonly || evalModifier(child.getAttribute('readonly'), record);
-                const isRequired = child.getAttribute('required') === '1' || fieldDef.required || evalModifier(child.getAttribute('required'), record);
+                // Explicitly respect explicit readonly attribute only when explicitly true, avoiding blank-state coercion locking
+                const readonlyAttr = child.getAttribute('readonly');
+                const isReadonly = readonlyAttr === '1' || readonlyAttr === 'True' || fieldDef.readonly || (readonlyAttr ? evalModifier(readonlyAttr, record) : false);
+                const isRequired = child.getAttribute('required'] === '1' || fieldDef.required || evalModifier(child.getAttribute('required'), record);
 
                 if (fieldDef.type === 6) {
                     return React.createElement(One2manyGrid, {
@@ -2241,11 +2242,11 @@ public class SalesModule : IOdooAddon
                     </header>
                     <sheet>
                         <group string="Customer Information">
-                            <field name="name" readonly="status != 'draft'"/>
-                            <field name="partner_id" readonly="status != 'draft'"/>
+                            <field name="name"/>
+                            <field name="partner_id"/>
                         </group>
                         <group string="Order Lines">
-                            <field name="order_line" readonly="status != 'draft'"/>
+                            <field name="order_line"/>
                         </group>
                         <group string="Profitability Summary">
                             <field name="amount_untaxed"/>
@@ -2861,11 +2862,11 @@ public class PurchaseModule : IOdooAddon
                     </header>
                     <sheet>
                         <group string="Vendor Info">
-                            <field name="name" readonly="status != 'draft'"/>
-                            <field name="partner_id" readonly="status != 'draft'"/>
+                            <field name="name"/>
+                            <field name="partner_id"/>
                         </group>
                         <group string="Products">
-                            <field name="order_line" readonly="status != 'draft'"/>
+                            <field name="order_line"/>
                         </group>
                         <group string="Total">
                             <field name="amount_total"/>
@@ -3045,11 +3046,11 @@ public class InvoicingModule : IOdooAddon
                     </header>
                     <sheet>
                         <group string="Details">
-                            <field name="name" readonly="status != 'draft'"/>
-                            <field name="partner_id" readonly="status != 'draft'"/>
-                            <field name="invoice_type" readonly="status != 'draft'"/>
-                            <field name="invoice_line_ids" readonly="status != 'draft'"/>
-                            <field name="amount_total" readonly="status != 'draft'"/>
+                            <field name="name"/>
+                            <field name="partner_id"/>
+                            <field name="invoice_type"/>
+                            <field name="invoice_line_ids"/>
+                            <field name="amount_total"/>
                             <field name="status"/>
                         </group>
                     </sheet>
