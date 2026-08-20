@@ -9,35 +9,38 @@ public class PurchaseOrderLineModel : OdooModel
     public PurchaseOrderLineModel()
     {
         AddField("order_id", FieldType.Many2one, "Order Reference", relation: "purchase.order", module: "PurchaseAddon");
-        AddField("product_id", FieldType.Many2one, "Product", relation: "product.template", required: true, module: "PurchaseAddon");
-        AddField("name", FieldType.Char, "Description", module: "PurchaseAddon");
+        AddField("product_id", FieldType.Many2one, "Product Name", relation: "product.template", required: true, module: "PurchaseAddon");
+        AddField("lot_id", FieldType.Many2one, "Batch No / Lot", relation: "stock.lot", module: "PurchaseAddon");
+        AddField("mrp", FieldType.Float, "MRP ($)", defaultValue: 0.0, module: "PurchaseAddon");
         AddField("product_uom_qty", FieldType.Float, "Quantity", defaultValue: 1.0, module: "PurchaseAddon");
-        AddField("price_unit", FieldType.Float, "Unit Price", defaultValue: 0.0, module: "PurchaseAddon");
-        AddField("price_subtotal", FieldType.Float, "Subtotal", defaultValue: 0.0, readonlyField: true, module: "PurchaseAddon");
-        
-        AddField("custom_spec_note", FieldType.Char, "Custom Specs / Note", module: "PurchaseAddon");
-        AddField("discount_tier", FieldType.Selection, "Discount Tier", defaultValue: "standard", selection: new List<SelectionOption>
-        {
-            new("standard", "Standard (0%)"),
-            new("tier1", "Tier 1 (5%)"),
-            new("tier2", "Tier 2 (10%)")
-        }, module: "PurchaseAddon");
+        AddField("price_unit", FieldType.Float, "Purchase Price ($)", defaultValue: 0.0, module: "PurchaseAddon");
+        AddField("price_subtotal", FieldType.Float, "Total Price ($)", defaultValue: 0.0, readonlyField: true, compute: "ComputeTotalPrice", module: "PurchaseAddon");
     }
 
-    [ApiDepends("product_uom_qty", "price_unit", "discount_tier")]
-    public void ComputeSubtotal(Dictionary<string, object> line)
+    [ApiOnchange("lot_id")]
+    public Dictionary<string, object> OnChangeLot(Dictionary<string, object> values, ModelRegistry registry)
+    {
+        var res = new Dictionary<string, object>();
+        if (values.TryGetValue("lot_id", out var lotIdObj) && lotIdObj != null)
+        {
+            int lotId = lotIdObj is object[] arr ? Convert.ToInt32(arr[0]) : Convert.ToInt32(lotIdObj);
+            var lots = registry.SearchRead("stock.lot", ["batch_mrp", "batch_purchase_price"], [["id", "=", lotId]]);
+            if (lots.Count > 0)
+            {
+                var lot = lots[0];
+                if (lot.TryGetValue("batch_mrp", out var mrp)) res["mrp"] = mrp;
+                if (lot.TryGetValue("batch_purchase_price", out var pp)) res["price_unit"] = pp;
+            }
+        }
+        return res;
+    }
+
+    [ApiDepends("product_uom_qty", "price_unit")]
+    public void ComputeTotalPrice(Dictionary<string, object> line)
     {
         var qty = Convert.ToDouble(line.TryGetValue("product_uom_qty", out var q) ? q : 1.0);
         var price = Convert.ToDouble(line.TryGetValue("price_unit", out var p) ? p : 0.0);
-        
-        double discountMultiplier = 1.0;
-        if (line.TryGetValue("discount_tier", out var dt) && dt != null)
-        {
-            if (dt.ToString() == "tier1") discountMultiplier = 0.95;
-            else if (dt.ToString() == "tier2") discountMultiplier = 0.90;
-        }
-
-        line["price_subtotal"] = (qty * price) * discountMultiplier;
+        line["price_subtotal"] = qty * price;
     }
 }
 

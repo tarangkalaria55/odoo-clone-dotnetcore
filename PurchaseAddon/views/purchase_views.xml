@@ -28,7 +28,7 @@
                             <field name="name"/>
                             <field name="partner_id"/>
                         </group>
-                        <group string="Products">
+                        <group string="Products &amp; Batches">
                             <field name="order_line"/>
                         </group>
                         <group string="Total">
