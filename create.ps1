@@ -1541,9 +1541,21 @@ function Chatter({ model, recordId }) {
 function One2manyGrid({ fieldDef, lines = [], onLinesChange }) {
     const childModel = fieldDef.relation;
     const [childFields, setChildFields] = useState({});
+    const [relOptions, setRelOptions] = useState({});
 
     useEffect(() => {
-        callKw(childModel, 'get_view', [], { view_type: 'tree' }).then(res => setChildFields(res.fields));
+        async function loadChildView() {
+            const res = await callKw(childModel, 'get_view', [], { view_type: 'tree' });
+            setChildFields(res.fields);
+
+            for (const [fname, fdef] of Object.entries(res.fields)) {
+                if (fdef.type === 5 && fdef.relation) {
+                    const opts = await callKw(fdef.relation, 'name_search', []);
+                    setRelOptions(prev => ({ ...prev, [fname]: opts }));
+                }
+            }
+        }
+        loadChildView();
     }, [childModel]);
 
     const addLine = () => {
@@ -1558,14 +1570,12 @@ function One2manyGrid({ fieldDef, lines = [], onLinesChange }) {
         const updated = [...lines];
         updated[index] = { ...updated[index], [fieldName]: value };
 
-        if (childModel === 'account.move.line' && fieldName === 'lot_id') {
-            try {
-                const res = await callKw(childModel, 'onchange', [fieldName, updated[index]]);
-                if (res && res.value) {
-                    updated[index] = { ...updated[index], ...res.value };
-                }
-            } catch (err) { console.error(err); }
-        }
+        try {
+            const res = await callKw(childModel, 'onchange', [fieldName, updated[index]]);
+            if (res && res.value) {
+                updated[index] = { ...updated[index], ...res.value };
+            }
+        } catch (err) { }
 
         if (fieldName === 'quantity' || fieldName === 'price_unit' || fieldName === 'product_uom_qty') {
             const qty = parseFloat(updated[index].quantity || updated[index].product_uom_qty) || 0;
@@ -1596,20 +1606,25 @@ function One2manyGrid({ fieldDef, lines = [], onLinesChange }) {
                         cols.map(col => {
                             const fdef = childFields[col];
                             if (fdef && fdef.type === 5 && fdef.relation) {
+                                const currentVal = Array.isArray(line[col]) ? line[col][0] : line[col];
                                 return React.createElement('td', { key: col, className: 'p-1' },
-                                    React.createElement('input', {
-                                        className: 'form-control form-control-sm border-0 bg-transparent',
-                                        value: line[col] ?? '',
-                                        placeholder: 'Lot ID #',
-                                        onChange: (e) => updateCell(idx, col, parseInt(e.target.value) || 0),
-                                        type: 'number'
-                                    })
+                                    React.createElement('select', {
+                                        className: 'form-select form-select-sm border-0 bg-transparent',
+                                        value: currentVal || '',
+                                        onChange: (e) => updateCell(idx, col, parseInt(e.target.value) || 0)
+                                    },
+                                        React.createElement('option', { value: '' }, '-- Select --'),
+                                        (relOptions[col] || []).map(([optId, optName]) =>
+                                            React.createElement('option', { key: optId, value: optId }, optName)
+                                        )
+                                    )
                                 );
                             }
                             return React.createElement('td', { key: col, className: 'p-1' },
                                 React.createElement('input', {
                                     className: 'form-control form-control-sm border-0 bg-transparent',
                                     value: line[col] ?? '',
+                                    readOnly: fdef?.readonly,
                                     onChange: (e) => updateCell(idx, col, fdef?.type === 1 || fdef?.type === 2 ? parseFloat(e.target.value) || 0 : e.target.value),
                                     type: fdef?.type === 1 || fdef?.type === 2 ? 'number' : 'text'
                                 })
