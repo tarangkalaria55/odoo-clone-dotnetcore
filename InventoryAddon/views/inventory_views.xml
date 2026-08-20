@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <record id="stock.view_warehouse_tree" model="ir.ui.view">
+            <field name="name">stock.warehouse.tree</field>
+            <field name="model">stock.warehouse</field>
+            <field name="arch" type="xml">
+                <tree string="Warehouses">
+                    <field name="id"/>
+                    <field name="name"/>
+                    <field name="code"/>
+                </tree>
+            </field>
+        </record>
+
+        <record id="stock.view_warehouse_form" model="ir.ui.view">
+            <field name="name">stock.warehouse.form</field>
+            <field name="model">stock.warehouse</field>
+            <field name="arch" type="xml">
+                <form string="Warehouse">
+                    <sheet>
+                        <group string="Warehouse Info">
+                            <field name="name"/>
+                            <field name="code"/>
+                        </group>
+                    </sheet>
+                    <div class="oe_chatter"/>
+                </form>
+            </field>
+        </record>
+
+        <record id="stock.view_quant_tree" model="ir.ui.view">
+            <field name="name">stock.quant.tree</field>
+            <field name="model">stock.quant</field>
+            <field name="arch" type="xml">
+                <tree string="Inventory Valuation (Quants)">
+                    <field name="id"/>
+                    <field name="product_id"/>
+                    <field name="lot_id"/>
+                    <field name="quantity"/>
+                    <field name="location_name"/>
+                </tree>
+            </field>
+        </record>
+
+        <menuitem id="warehouse_app" name="Warehouses" icon="bi-building" action_type="act_window" model="stock.warehouse" view_mode="tree,kanban,form"/>
+        <menuitem id="quants_app" name="Stock Quants" icon="bi-bar-chart-steps" action_type="act_window" model="stock.quant" view_mode="tree,kanban,form"/>
+
+        <record id="demo_wh_1" model="stock.warehouse">
+            <field name="name">Main Chicago Hub</field>
+            <field name="code">CHI</field>
+        </record>
+
+        <record id="demo_quant_1" model="stock.quant">
+            <field name="product_id">1</field>
+            <field name="lot_id">1</field>
+            <field name="quantity">25.0</field>
+            <field name="location_name">CHI/Stock</field>
+        </record>
+    </data>
+</odoo>

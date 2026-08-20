@@ -1,0 +1,10 @@
+<Solution>
+  <Project Path="AccountingAddon/AccountingAddon.csproj" />
+  <Project Path="Core.OdooEngine/Core.OdooEngine.csproj" />
+  <Project Path="HostApp/HostApp.csproj" />
+  <Project Path="InventoryAddon/InventoryAddon.csproj" />
+  <Project Path="InvoicingAddon/InvoicingAddon.csproj" />
+  <Project Path="ProductAddon/ProductAddon.csproj" />
+  <Project Path="PurchaseAddon/PurchaseAddon.csproj" />
+  <Project Path="SalesAddon/SalesAddon.csproj" />
+</Solution>

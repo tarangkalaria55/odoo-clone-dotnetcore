@@ -1,0 +1,11 @@
+{
+  "name": "Sales Management & Profit Reports",
+  "version": "1.0.0",
+  "category": "Sales",
+  "summary": "Customer Sales Orders, Margins, and Financial P&L Analytics",
+  "depends": [ "base", "ProductAddon", "InvoicingAddon" ],
+  "data": [ "views/sales_views.xml" ],
+  "application": true,
+  "installable": true,
+  "assemblyFile": "SalesAddon.dll"
+}

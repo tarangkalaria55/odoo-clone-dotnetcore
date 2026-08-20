@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <record id="sale.view_order_tree" model="ir.ui.view">
+            <field name="name">sale.order.tree</field>
+            <field name="model">sale.order</field>
+            <field name="arch" type="xml">
+                <tree string="Sales Orders">
+                    <field name="id"/>
+                    <field name="name"/>
+                    <field name="partner_id"/>
+                    <field name="amount_total"/>
+                    <field name="total_margin"/>
+                    <field name="status"/>
+                </tree>
+            </field>
+        </record>
+
+        <record id="sale.view_order_form" model="ir.ui.view">
+            <field name="name">sale.order.form</field>
+            <field name="model">sale.order</field>
+            <field name="arch" type="xml">
+                <form string="Sales Order">
+                    <header>
+                        <button name="ActionConfirmSales" string="Confirm Order" type="object" class="btn-success" invisible="status != 'draft'"/>
+                    </header>
+                    <sheet>
+                        <group string="Customer Information">
+                            <field name="name" readonly="status != 'draft'"/>
+                            <field name="partner_id" readonly="status != 'draft'"/>
+                        </group>
+                        <group string="Order Lines">
+                            <field name="order_line" readonly="status != 'draft'"/>
+                        </group>
+                        <group string="Profitability Summary">
+                            <field name="amount_untaxed"/>
+                            <field name="amount_tax"/>
+                            <field name="amount_total"/>
+                            <field name="total_margin"/>
+                            <field name="status"/>
+                        </group>
+                    </sheet>
+                    <div class="oe_chatter"/>
+                </form>
+            </field>
+        </record>
+
+        <menuitem id="sales_app" name="Sales" icon="bi-cart-check-fill" action_type="act_window" model="sale.order" view_mode="tree,kanban,form"/>
+        <menuitem id="sales_pl_report" name="Profit &amp; Loss Report" icon="bi-graph-up-arrow" action_type="client_action" client_url="/addons/salesaddon/sales_report.js" client_export="ProfitAndLossReport"/>
+
+        <record id="demo_so_1" model="sale.order">
+            <field name="name">SO-001</field>
+            <field name="partner_id">1</field>
+            <field name="amount_untaxed">1500.0</field>
+            <field name="amount_tax">150.0</field>
+            <field name="amount_total">1650.0</field>
+            <field name="total_margin">750.0</field>
+            <field name="status">sale</field>
+        </record>
+
+        <record id="demo_so_line_1" model="sale.order.line">
+            <field name="order_id">1</field>
+            <field name="product_id">1</field>
+            <field name="name">Executive Ergonomic Desk</field>
+            <field name="product_uom_qty">2.0</field>
+            <field name="price_unit">750.0</field>
+            <field name="price_subtotal">1500.0</field>
+            <field name="margin">750.0</field>
+        </record>
+    </data>
+</odoo>

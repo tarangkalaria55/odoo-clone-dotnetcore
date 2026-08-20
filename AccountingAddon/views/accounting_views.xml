@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <record id="account.view_account_tree" model="ir.ui.view">
+            <field name="name">account.account.tree</field>
+            <field name="model">account.account</field>
+            <field name="arch" type="xml">
+                <tree string="Chart of Accounts">
+                    <field name="code"/>
+                    <field name="name"/>
+                    <field name="account_type"/>
+                    <field name="current_balance"/>
+                </tree>
+            </field>
+        </record>
+
+        <record id="account.view_account_form" model="ir.ui.view">
+            <field name="name">account.account.form</field>
+            <field name="model">account.account</field>
+            <field name="arch" type="xml">
+                <form string="Account">
+                    <sheet>
+                        <group string="Configuration">
+                            <field name="code"/>
+                            <field name="name"/>
+                            <field name="account_type"/>
+                            <field name="current_balance"/>
+                        </group>
+                    </sheet>
+                    <div class="oe_chatter"/>
+                </form>
+            </field>
+        </record>
+
+        <menuitem id="accounting_app" name="Accounting" icon="bi-bank" action_type="act_window" model="account.account" view_mode="tree,kanban,form"/>
+    </data>
+</odoo>

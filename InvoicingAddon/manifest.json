@@ -1,0 +1,11 @@
+{
+  "name": "Invoicing & Billing",
+  "version": "1.0.0",
+  "category": "Accounting",
+  "summary": "Customer Invoices, Vendor Bills, Batch-driven MRP and Discount rules",
+  "depends": [ "base", "ProductAddon" ],
+  "data": [ "views/invoicing_views.xml" ],
+  "application": true,
+  "installable": true,
+  "assemblyFile": "InvoicingAddon.dll"
+}

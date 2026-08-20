@@ -1,0 +1,11 @@
+{
+  "name": "Accounting & Financial Statements",
+  "version": "1.0.0",
+  "category": "Accounting",
+  "summary": "Chart of Accounts and Financial Ledgers",
+  "depends": [ "base" ],
+  "data": [ "views/accounting_views.xml" ],
+  "application": true,
+  "installable": true,
+  "assemblyFile": "AccountingAddon.dll"
+}

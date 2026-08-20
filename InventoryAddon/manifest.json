@@ -1,0 +1,11 @@
+{
+  "name": "Inventory & Stock",
+  "version": "1.0.0",
+  "category": "Supply Chain",
+  "summary": "Warehouse management, Quants, Stock Transfers",
+  "depends": [ "base", "ProductAddon" ],
+  "data": [ "views/inventory_views.xml" ],
+  "application": true,
+  "installable": true,
+  "assemblyFile": "InventoryAddon.dll"
+}
