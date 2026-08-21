@@ -76,20 +76,88 @@ in code too).
       any install, any discovered "glue" module whose `Depends` are now
       all satisfied and `AutoInstall: true` installs itself automatically.
 
+- [x] **SQL injection fix** (not from the survey — found while auditing per
+      explicit request): `model` in every RPC call (`req.Model` from the
+      JSON body) flowed unvalidated into raw `FROM`/`INSERT INTO`/`UPDATE`/
+      `DELETE` table-name interpolation in `SearchRead`/`Create`/`Write`/
+      `Unlink` — column names were already safe (filtered against the real
+      schema) but the table name wasn't. Added `ModelRegistry.EnsureModelExists`
+      (throws `UserError`, matching Odoo's own `execute_cr`: `"if recs is
+      None: raise UserError(...)"`), called at the top of all four entry
+      points, plus defense-in-depth quote-escaping in `Quote()`. Verified
+      live: `model` containing `"; DROP TABLE res_users;--` now 422s before
+      any SQL is built; normal queries and the target table are unaffected.
+
+- [x] **Audit columns (dates)** (`create_date`/`write_date`, `models.py`
+      `MetaModel`) — every model now gets these two universal columns via
+      `AutoSyncSchema`, server-set in UTC on `Create`/`Write` and never
+      client-overridable. `create_uid`/`write_uid` deferred — needs a
+      "current user" context threaded through `ModelRegistry`, same
+      prerequisite as the `sudo()` item below.
+- [x] **`active` field + default archive filter** (`models.py`
+      `active_test`) — every model gets `active` (default `true`);
+      `SearchRead` hides `active=false` rows unless the caller's domain
+      explicitly mentions `active`. Pre-existing rows with no value yet
+      (`NULL`, from before this migration) correctly still count as active.
+- [x] **`copy()` / duplicate** — `ModelRegistry.Copy` (shallow clone: id/
+      create_date/write_date/One2many lines excluded), wired as RPC method
+      `copy` and a "Duplicate" button next to Save/Discard on every form.
+      All of the above verified live against Postgres (create → audit
+      columns present; archive → hidden by default, visible when asked;
+      pre-existing row with NULL `active` still returned; duplicate
+      produces a real independent new record).
+
+- [x] **Many2many fields** (`odoo/orm/fields_relational.py`) — real
+      `FieldType.Many2many` (appended as enum value 9, not inserted, so
+      webclient.js's existing hardcoded numeric type checks don't shift).
+      `DatabaseAdapter.ManyToManyTable` derives a join table + two id
+      columns from `(model, fieldName, relation)`, auto-created in
+      `AutoSyncPhysicalDatabase`. `SearchRead` resolves it to `[[id,name],
+      ...]` tuples (consistent with how Many2one already reads); `Create`/
+      `Write` sync the join table via `SyncMany2many` (accepts either raw
+      ids or `[id,name]` tuples, so round-tripping a previous read works);
+      `Unlink` cleans up join rows in both directions (this model's own
+      m2m fields, and any other model's m2m field that references the
+      deleted record) so nothing dangles. `Copy()` carries m2m values over
+      to the duplicate, matching Odoo's default. Frontend: a native
+      `<select multiple>` widget for field type 9, options loaded the same
+      way Many2one's dropdown already is.
+
+      **Used to retire the `res.users.group_ids` CSV-string hack**
+      (`Security.cs`) — it's now a real many2many to `res.groups`;
+      `SecurityGroups.Admin`/`Employee` changed from fake XML-id-style
+      strings (`"base.group_system"`) to the group's actual `name`, since
+      a real relation has no XML-id registry to match against.
+
+      Verified live against Postgres: login resolves admin status through
+      the real relation; `search_read`/`write` read and write `group_ids`
+      correctly; deleting a referenced group cleanly drops it from every
+      user's `group_ids` with no orphaned join-table row; `copy()` carries
+      the relation to the duplicate. (One hiccup along the way: the `admin`
+      user row pre-existed in this dev database from earlier test runs in
+      this session, created before the migration, so it had no join-table
+      entries and `AdminOnlyModels` blocked fixing it through the API
+      itself — a real chicken-and-egg gap in that hardcoded gate, not
+      something to silently work around. Fixed with a direct one-off SQL
+      insert against the dev DB, the same way a real deployment would run
+      a data-migration script — not a code change.)
+
+      **Not done**: a dedicated Users/Groups management screen (no
+      `res.users` menu/form view exists in any addon) — out of scope, this
+      item was about the field type existing and working, not building UI
+      for it. `AdminOnlyModels`' chicken-and-egg gap surfaced above is
+      also unresolved — revisit once `sudo()`/superuser escalation (in the
+      out-of-scope list) exists, so a bootstrap path doesn't require
+      already being admin.
+
 ## In progress / next up (priority order, core framework only)
 
-1. [ ] **Many2many fields** (`odoo/orm/fields_relational.py`) — a real
-       `FieldType.Many2many` with a join-table representation. Today
-       `res.users.group_ids` is a CSV-string hack (documented in
-       `Security.cs`); this would replace that and support tags/multi-select
-       relations generally. Needs a webclient.js multi-select widget too
-       (currently the type-5 relational `<select>` is single-value only).
-2. [ ] **X2many write-commands** (`odoo/orm/commands.py`, the
+1. [ ] **X2many write-commands** (`odoo/orm/commands.py`, the
        `(0,0,vals)`/`(4,id)`/`(6,0,ids)` tuple language) — currently
        `webclient.js` issues separate `create`/`write` calls per O2M line
        instead of one command list. Real behavior change, not just
        internals; needs a client + `Write`/`Create` change together.
-3. [ ] **OR/NOT domain grouping** (`odoo/osv/expression.py`, `odoo/orm/domains.py`
+2. [ ] **OR/NOT domain grouping** (`odoo/osv/expression.py`, `odoo/orm/domains.py`
        prefix notation: `['|', ('a','=',1), ('b','=',2)]`) — `SearchRead`'s
        domain today only ANDs a flat list of leaves; there's no way to
        express OR or a negated sub-group at all. Needs a small
@@ -100,29 +168,25 @@ in code too).
        C# collection-expression literal (`[["field","=",val]]`) — needs a
        careful, isolated pass with its own verification, not bundled into
        a larger batch.
-4. [ ] **Many2one `ondelete` policy** (`odoo/orm/fields_relational.py`
+3. [ ] **Many2one `ondelete` policy** (`odoo/orm/fields_relational.py`
        `Many2one` `ondelete=`) — `Unlink()` has no FK-safety net; deleting
        a referenced row either orphans child rows or throws a raw Postgres
        FK-violation exception instead of a friendly error / cascade.
-5. [ ] **Batch create** (`@api.model_create_multi`, `decorators.py`) —
+4. [ ] **Batch create** (`@api.model_create_multi`, `decorators.py`) —
        `Create()` is single-record only; no list-of-dicts create path.
-6. [ ] **Audit columns** (`create_uid`/`create_date`/`write_uid`/
-       `write_date`, `models.py` `MetaModel`) — no baseline who/when trail
-       on any record.
-7. [ ] **`active` field + default archive filter** (`models.py`
-       `active_test`) — soft-delete via `active=false`, auto-excluded from
-       `SearchRead` unless asked for; today only hard `Unlink` exists.
-8. [ ] **`_sql_constraints`** (`models.py` `_add_sql_constraints`) —
+5. [ ] **`_sql_constraints`** (`models.py` `_add_sql_constraints`) —
        declarative unique/check constraints with friendly error text
        instead of a raw Postgres unique-violation.
-9. [ ] **`copy()` / duplicate** (`models.py`) — no record-clone action;
-       "Duplicate" is a standard button on every real Odoo form.
-10. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
+6. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
        `IOdooAddon` has no lifecycle callback beyond `RegisterModels` for
        one-time data seeding/migration on install or cleanup on uninstall.
-11. [ ] **`any`/`not any` domain operator** — relational sub-domain
+7. [ ] **`create_uid`/`write_uid`** (`models.py` `MetaModel`) — needs a
+       "current user" context threaded through `ModelRegistry` CRUD calls
+       from `UniversalRpcController`'s `HttpContext.User`; same prerequisite
+       as `sudo()`/superuser escalation (see out-of-scope section).
+8. [ ] **`any`/`not any` domain operator** — relational sub-domain
        matching, e.g. `[('invoice_line_ids','any',[('price_unit','>',100)])]`.
-       Depends on #3 (domain tree) landing first. Lower priority than the
+       Depends on #2 (domain tree) landing first. Lower priority than the
        above; genuinely needs a related-model subquery-style evaluation.
 
 ## Explicitly out of scope
