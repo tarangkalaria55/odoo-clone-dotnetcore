@@ -171,7 +171,7 @@ function One2manyGrid({ fieldDef, lines = [], onLinesChange }) {
             if (res && res.value) {
                 updated[index] = { ...updated[index], ...res.value };
             }
-        } catch (err) { console.error(err); }
+        } catch (err) { }
 
         if (fieldName === 'quantity' || fieldName === 'price_unit' || fieldName === 'product_uom_qty') {
             const qty = parseFloat(updated[index].quantity || updated[index].product_uom_qty) || 0;

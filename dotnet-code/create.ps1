@@ -1,5 +1,7 @@
 $ErrorActionPreference = "Stop"
 
+Set-Location $PSScriptRoot
+
 Write-Host "==> Initializing Complete Modular Odoo .NET 10 Enterprise Suite..." -ForegroundColor Cyan
 
 # Clean previous solution if present

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "context-engine": {
+      "command": "C:\\Users\\tarang-005300\\.local\\bin\\cce.exe",
+      "args": [
+        "serve",
+        "--project-dir",
+        "D:\\Practice\\custom"
+      ]
+    }
+  }
+}
