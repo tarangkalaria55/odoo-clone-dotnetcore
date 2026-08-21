@@ -1,4 +1,5 @@
 using System.Data;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Text.Json;
@@ -6,12 +7,9 @@ using System.Xml.Linq;
 using System.Xml.XPath;
 using Dapper;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.SqlClient;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using MySqlConnector;
 using Npgsql;
 
 namespace Core.OdooEngine;
@@ -36,12 +34,9 @@ public class ApiConstrainsAttribute(params string[] fields) : Attribute
 
 public class ValidationError(string message) : Exception(message);
 
-public enum DatabaseProvider { InMemory, PostgreSql, SqlServer, MySql, Sqlite }
-
 public class AppSettingsConfig
 {
     public List<string> AddonsPath { get; set; } = new() { "addons" };
-    public string DbType { get; set; } = "InMemory";
     public string ConnectionString { get; set; } = "";
     public int Port { get; set; } = 5000;
 
@@ -80,6 +75,9 @@ public class OdooManifest
     public string Version { get; set; } = "1.0.0";
     public string Category { get; set; } = "Uncategorized";
     public string Summary { get; set; } = string.Empty;
+    public string Author { get; set; } = "Odoo .NET Suite";
+    public string Website { get; set; } = string.Empty;
+    public string License { get; set; } = "LGPL-3";
     public List<string> Depends { get; set; } = new();
     public List<string> Data { get; set; } = new();
     public bool Application { get; set; } = false;
@@ -195,10 +193,26 @@ public abstract class OdooModel
         }
     }
 
+    // Mirrors Odoo's get_public_method (odoo/service/model.py): only model-declared action
+    // methods are callable over RPC, not framework hooks or inherited object members.
+    private static readonly HashSet<string> RpcBlockedMethods = new(StringComparer.OrdinalIgnoreCase)
+    {
+        nameof(ToString), nameof(Equals), nameof(GetHashCode), nameof(GetType),
+        nameof(AddField), nameof(EvaluateOnchange), nameof(ExecuteMethod)
+    };
+
+    private static bool IsCallableAction(MethodInfo method) =>
+        !RpcBlockedMethods.Contains(method.Name)
+        && method.GetCustomAttribute<ApiOnchangeAttribute>() == null
+        && method.GetCustomAttribute<ApiDependsAttribute>() == null
+        && method.GetCustomAttribute<ApiConstrainsAttribute>() == null
+        && method.DeclaringType != typeof(OdooModel)
+        && method.DeclaringType != typeof(object);
+
     public virtual object? ExecuteMethod(string methodName, int id, Dictionary<string, object> values, ModelRegistry registry, Func<object?>? next = null)
     {
         var method = this.GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-        if (method != null)
+        if (method != null && IsCallableAction(method))
         {
             var parameters = method.GetParameters();
             return parameters.Length switch
@@ -253,98 +267,57 @@ public class MenuRegistry
     public IReadOnlyList<OdooMenuItem> GetMenus() => _menus;
 }
 
+// Odoo itself only ever supports PostgreSQL (see odoo/sql_db.py) - this mirrors that:
+// one provider, no abstraction for providers that will never be swapped in.
 public class DatabaseAdapter
 {
-    public DatabaseProvider Provider { get; }
     public string ConnectionString { get; }
     private readonly ILogger<DatabaseAdapter> _logger;
 
     public DatabaseAdapter(AppSettingsConfig config, ILogger<DatabaseAdapter> logger)
     {
         _logger = logger;
-        Provider = Enum.TryParse<DatabaseProvider>(config.DbType, true, out var p) ? p : DatabaseProvider.InMemory;
         ConnectionString = config.ConnectionString;
-        _logger.LogInformation("Database Adapter active: {Provider}", Provider);
+        _logger.LogInformation("Database Adapter active: PostgreSQL");
     }
 
-    public IDbConnection CreateConnection()
-    {
-        return Provider switch
-        {
-            DatabaseProvider.PostgreSql => new NpgsqlConnection(ConnectionString),
-            DatabaseProvider.SqlServer => new SqlConnection(ConnectionString),
-            DatabaseProvider.MySql => new MySqlConnection(ConnectionString),
-            DatabaseProvider.Sqlite => new SqliteConnection(string.IsNullOrWhiteSpace(ConnectionString) ? "Data Source=odoodotnet.db" : ConnectionString),
-            _ => null!
-        };
-    }
+    public IDbConnection CreateConnection() => new NpgsqlConnection(ConnectionString);
 
     public string Sanitize(string modelName) => modelName.Replace(".", "_").ToLower();
 
-    public string Quote(string identifier)
-    {
-        return Provider switch
-        {
-            DatabaseProvider.PostgreSql or DatabaseProvider.Sqlite => $"\"{identifier}\"",
-            DatabaseProvider.SqlServer => $"[{identifier}]",
-            DatabaseProvider.MySql => $"`{identifier}`",
-            _ => identifier
-        };
-    }
+    public string Quote(string identifier) => $"\"{identifier}\"";
 
-    public string MapSqlType(FieldType type)
+    public string MapSqlType(FieldType type) => type switch
     {
-        return type switch
-        {
-            FieldType.Integer => Provider == DatabaseProvider.Sqlite ? "INTEGER" : "INT",
-            FieldType.Float => Provider == DatabaseProvider.PostgreSql ? "DOUBLE PRECISION" : (Provider == DatabaseProvider.Sqlite ? "REAL" : "FLOAT"),
-            FieldType.Boolean => Provider == DatabaseProvider.SqlServer ? "BIT" : (Provider == DatabaseProvider.MySql ? "TINYINT(1)" : "BOOLEAN"),
-            FieldType.DateTime => Provider == DatabaseProvider.Sqlite ? "TEXT" : "TIMESTAMP",
-            FieldType.Many2one => Provider == DatabaseProvider.Sqlite ? "INTEGER" : "INT",
-            FieldType.Text => Provider == DatabaseProvider.SqlServer ? "NVARCHAR(MAX)" : "TEXT",
-            _ => Provider == DatabaseProvider.Sqlite ? "TEXT" : "VARCHAR(255)"
-        };
-    }
+        FieldType.Integer => "INT",
+        FieldType.Float => "DOUBLE PRECISION",
+        FieldType.Boolean => "BOOLEAN",
+        FieldType.DateTime => "TIMESTAMP",
+        FieldType.Many2one => "INT",
+        _ => "TEXT"
+    };
 
     public void AutoSyncPhysicalDatabase(Dictionary<string, Dictionary<string, FieldDef>> desiredModels)
     {
-        if (Provider == DatabaseProvider.InMemory) return;
         using var conn = CreateConnection();
         conn.Open();
 
         foreach (var (modelName, fields) in desiredModels)
         {
             var tbl = Sanitize(modelName);
-            var createSql = Provider switch
-            {
-                DatabaseProvider.PostgreSql => $@"CREATE TABLE IF NOT EXISTS {Quote(tbl)} (id SERIAL PRIMARY KEY);",
-                DatabaseProvider.SqlServer => $@"IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{tbl}' and xtype='U') CREATE TABLE {Quote(tbl)} (id INT IDENTITY(1,1) PRIMARY KEY);",
-                DatabaseProvider.MySql => $@"CREATE TABLE IF NOT EXISTS {Quote(tbl)} (id INT AUTO_INCREMENT PRIMARY KEY);",
-                DatabaseProvider.Sqlite => $@"CREATE TABLE IF NOT EXISTS {Quote(tbl)} (id INTEGER PRIMARY KEY AUTOINCREMENT);",
-                _ => ""
-            };
-            conn.Execute(createSql);
+            conn.Execute($@"CREATE TABLE IF NOT EXISTS {Quote(tbl)} (id SERIAL PRIMARY KEY);");
 
             foreach (var (fname, fdef) in fields)
             {
                 if (fname == "id" || fdef.Type == FieldType.One2many) continue;
                 var colType = MapSqlType(fdef.Type);
-                var alterSql = Provider switch
-                {
-                    DatabaseProvider.PostgreSql => $"ALTER TABLE {Quote(tbl)} ADD COLUMN IF NOT EXISTS {Quote(fname)} {colType};",
-                    DatabaseProvider.SqlServer => $"IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'{tbl}') AND name = '{fname}') ALTER TABLE {Quote(tbl)} ADD {Quote(fname)} {colType};",
-                    DatabaseProvider.MySql => $"ALTER TABLE {Quote(tbl)} ADD COLUMN IF NOT EXISTS {Quote(fname)} {colType};",
-                    DatabaseProvider.Sqlite => $"ALTER TABLE {Quote(tbl)} ADD COLUMN {Quote(fname)} {colType};",
-                    _ => ""
-                };
-                try { conn.Execute(alterSql); } catch { }
+                try { conn.Execute($"ALTER TABLE {Quote(tbl)} ADD COLUMN IF NOT EXISTS {Quote(fname)} {colType};"); } catch { }
             }
         }
     }
 
     public void DropTable(string modelName)
     {
-        if (Provider == DatabaseProvider.InMemory) return;
         using var conn = CreateConnection();
         conn.Open();
         var tbl = Sanitize(modelName);
@@ -353,7 +326,6 @@ public class DatabaseAdapter
 
     public void DropColumn(string modelName, string columnName)
     {
-        if (Provider == DatabaseProvider.InMemory) return;
         using var conn = CreateConnection();
         conn.Open();
         var tbl = Sanitize(modelName);
@@ -365,7 +337,6 @@ public class ModelRegistry
 {
     private readonly Dictionary<string, List<OdooModel>> _registeredModelExtensions = new();
     private readonly Dictionary<string, Dictionary<string, FieldDef>> _activeSchema = new();
-    private readonly Dictionary<string, List<Dictionary<string, object>>> _inMemoryDataStore = new();
     private readonly List<ModelDataEntry> _modelData = new();
     private readonly List<MailMessage> _mailMessages = new();
     private readonly DatabaseAdapter _db;
@@ -426,7 +397,6 @@ public class ModelRegistry
 
         foreach (var model in standaloneModelsToDrop)
         {
-            _inMemoryDataStore.Remove(model);
             _registeredModelExtensions.Remove(model);
             _activeSchema.Remove(model);
             _db.DropTable(model);
@@ -438,10 +408,6 @@ public class ModelRegistry
             foreach (var col in colsToDrop)
             {
                 fields.Remove(col);
-                if (_inMemoryDataStore.TryGetValue(modelName, out var records))
-                {
-                    foreach (var rec in records) rec.Remove(col);
-                }
                 _db.DropColumn(modelName, col);
             }
         }
@@ -449,18 +415,10 @@ public class ModelRegistry
         var recordsToPurge = _modelData.Where(d => d.Module == moduleName && d.Type == "record").ToList();
         foreach (var entry in recordsToPurge)
         {
-            if (_db.Provider == DatabaseProvider.InMemory)
-            {
-                if (_inMemoryDataStore.TryGetValue(entry.Model, out var records))
-                    records.RemoveAll(r => r.TryGetValue("id", out var idVal) && idVal.ToString() == entry.ResId);
-            }
-            else
-            {
-                using var conn = _db.CreateConnection();
-                conn.Open();
-                var tbl = _db.Sanitize(entry.Model);
-                conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id = int.Parse(entry.ResId) });
-            }
+            using var conn = _db.CreateConnection();
+            conn.Open();
+            var tbl = _db.Sanitize(entry.Model);
+            conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id = int.Parse(entry.ResId) });
         }
         _modelData.RemoveAll(d => d.Module == moduleName);
     }
@@ -473,14 +431,8 @@ public class ModelRegistry
         var modelFields = GetFields(model);
         List<Dictionary<string, object>> records;
 
-        if (_db.Provider == DatabaseProvider.InMemory)
+        using (var conn = _db.CreateConnection())
         {
-            if (!_inMemoryDataStore.TryGetValue(model, out var memRecs)) return new();
-            records = memRecs.Select(r => new Dictionary<string, object>(r)).ToList();
-        }
-        else
-        {
-            using var conn = _db.CreateConnection();
             conn.Open();
             var tbl = _db.Sanitize(model);
             var rows = conn.Query($"SELECT * FROM {_db.Quote(tbl)}");
@@ -505,12 +457,27 @@ public class ModelRegistry
                 filtered = filtered.Where(r =>
                 {
                     if (!r.TryGetValue(field, out var rVal) || rVal == null) return false;
-                    if (op == "=") return rVal.ToString()!.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
-                    if (op == "!=") return !rVal.ToString()!.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
-                    if (op == "ilike") return rVal.ToString()!.Contains(val?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
-                    if (op == ">") return Convert.ToDouble(rVal) > Convert.ToDouble(val);
-                    if (op == "<") return Convert.ToDouble(rVal) < Convert.ToDouble(val);
-                    return true;
+                    var rStr = rVal.ToString()!;
+                    switch (op)
+                    {
+                        case "=": return rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+                        case "!=": return !rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+                        case "like": return rStr.Contains(val?.ToString() ?? "", StringComparison.Ordinal);
+                        case "not like": return !rStr.Contains(val?.ToString() ?? "", StringComparison.Ordinal);
+                        case "ilike": return rStr.Contains(val?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
+                        case "not ilike": return !rStr.Contains(val?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
+                        case "=like": return rStr.Equals(val?.ToString(), StringComparison.Ordinal);
+                        case "not =like": return !rStr.Equals(val?.ToString(), StringComparison.Ordinal);
+                        case "=ilike": return rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+                        case "not =ilike": return !rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+                        case ">": return Convert.ToDouble(rVal) > Convert.ToDouble(val);
+                        case ">=": return Convert.ToDouble(rVal) >= Convert.ToDouble(val);
+                        case "<": return Convert.ToDouble(rVal) < Convert.ToDouble(val);
+                        case "<=": return Convert.ToDouble(rVal) <= Convert.ToDouble(val);
+                        case "in": return val is System.Collections.IEnumerable inList and not string && inList.Cast<object?>().Any(x => x?.ToString() == rStr);
+                        case "not in": return val is System.Collections.IEnumerable notInList and not string && !notInList.Cast<object?>().Any(x => x?.ToString() == rStr);
+                        default: return true;
+                    }
                 });
             }
         }
@@ -581,31 +548,17 @@ public class ModelRegistry
             }
         }
 
-        int newId = 1;
+        int newId;
 
-        if (_db.Provider == DatabaseProvider.InMemory)
+        using (var conn = _db.CreateConnection())
         {
-            if (!_inMemoryDataStore.ContainsKey(model)) _inMemoryDataStore[model] = new();
-            newId = _inMemoryDataStore[model].Count > 0 ? (int)_inMemoryDataStore[model].Max(r => Convert.ToInt32(r["id"])) + 1 : 1;
-            record["id"] = newId;
-            _inMemoryDataStore[model].Add(record);
-        }
-        else
-        {
-            using var conn = _db.CreateConnection();
             conn.Open();
             var tbl = _db.Sanitize(model);
             var cols = record.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type != FieldType.One2many).ToList();
             var colNames = string.Join(", ", cols.Select(c => _db.Quote(c)));
             var paramNames = string.Join(", ", cols.Select(c => "@" + c));
 
-            var sql = _db.Provider switch
-            {
-                DatabaseProvider.PostgreSql => $"INSERT INTO {_db.Quote(tbl)} ({colNames}) VALUES ({paramNames}) RETURNING id;",
-                DatabaseProvider.SqlServer => $"INSERT INTO {_db.Quote(tbl)} ({colNames}) OUTPUT INSERTED.id VALUES ({paramNames});",
-                DatabaseProvider.Sqlite => $"INSERT INTO {_db.Quote(tbl)} ({colNames}) VALUES ({paramNames}); SELECT last_insert_rowid();",
-                _ => $"INSERT INTO {_db.Quote(tbl)} ({colNames}) VALUES ({paramNames}); SELECT LAST_INSERT_ID();"
-            };
+            var sql = $"INSERT INTO {_db.Quote(tbl)} ({colNames}) VALUES ({paramNames}) RETURNING id;";
 
             var parameters = new DynamicParameters();
             foreach (var col in cols) parameters.Add(col, record[col]);
@@ -646,52 +599,29 @@ public class ModelRegistry
             }
         }
 
-        if (_db.Provider == DatabaseProvider.InMemory)
-        {
-            if (!_inMemoryDataStore.TryGetValue(model, out var records)) return false;
-            var record = records.FirstOrDefault(r => Convert.ToInt32(r["id"]) == id);
-            if (record == null) return false;
+        using var conn = _db.CreateConnection();
+        conn.Open();
+        var tbl = _db.Sanitize(model);
+        var cols = recordValues.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type != FieldType.One2many).ToList();
+        var setClause = string.Join(", ", cols.Select(c => $"{_db.Quote(c)} = @{c}"));
 
-            foreach (var (k, v) in recordValues)
-            {
-                if (k != "id" && k != "message_ids") record[k] = v;
-            }
-            return true;
-        }
-        else
-        {
-            using var conn = _db.CreateConnection();
-            conn.Open();
-            var tbl = _db.Sanitize(model);
-            var cols = recordValues.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type != FieldType.One2many).ToList();
-            var setClause = string.Join(", ", cols.Select(c => $"{_db.Quote(c)} = @{c}"));
+        var sql = $"UPDATE {_db.Quote(tbl)} SET {setClause} WHERE id = @id";
+        var parameters = new DynamicParameters();
+        parameters.Add("id", id);
+        foreach (var col in cols) parameters.Add(col, recordValues[col]);
 
-            var sql = $"UPDATE {_db.Quote(tbl)} SET {setClause} WHERE id = @id";
-            var parameters = new DynamicParameters();
-            parameters.Add("id", id);
-            foreach (var col in cols) parameters.Add(col, recordValues[col]);
-
-            var success = conn.Execute(sql, parameters) > 0;
-            _logger.LogInformation("Record #{Id} updated on model {Model}", id, model);
-            return success;
-        }
+        var success = conn.Execute(sql, parameters) > 0;
+        _logger.LogInformation("Record #{Id} updated on model {Model}", id, model);
+        return success;
     }
 
     public bool Unlink(string model, int id)
     {
         _logger.LogWarning("Record #{Id} deleted from model {Model}", id, model);
-        if (_db.Provider == DatabaseProvider.InMemory)
-        {
-            if (!_inMemoryDataStore.TryGetValue(model, out var records)) return false;
-            return records.RemoveAll(r => Convert.ToInt32(r["id"]) == id) > 0;
-        }
-        else
-        {
-            using var conn = _db.CreateConnection();
-            conn.Open();
-            var tbl = _db.Sanitize(model);
-            return conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id }) > 0;
-        }
+        using var conn = _db.CreateConnection();
+        conn.Open();
+        var tbl = _db.Sanitize(model);
+        return conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id }) > 0;
     }
 
     public void LogMessage(string model, int recordId, string author, string body, string type = "comment")
@@ -744,6 +674,7 @@ public class ViewRegistry
     private readonly List<InheritedView> _inheritedViews = new();
 
     public void AddBaseView(BaseView view) => _baseViews[view.Id] = view;
+    public string? GetRawArch(string viewId) => _baseViews.TryGetValue(viewId, out var v) ? v.Arch : null;
     public void AddInheritedView(InheritedView view) => _inheritedViews.Add(view);
     public void RemoveModuleViews(string module)
     {
@@ -830,11 +761,12 @@ public static class XmlDataLoader
             }
             else if (model != null)
             {
+                var modelFields = models.GetFields(model);
                 var values = new Dictionary<string, object>();
                 foreach (var fieldNode in rec.Elements("field"))
                 {
                     var fname = fieldNode.Attribute("name")?.Value;
-                    if (fname != null) values[fname] = fieldNode.Value;
+                    if (fname != null) values[fname] = ConvertXmlFieldValue(fieldNode.Value, modelFields.GetValueOrDefault(fname));
                 }
                 int newId = models.Create(model, values);
                 models.TrackData(module, model, id, newId.ToString(), "record");
@@ -857,6 +789,16 @@ public static class XmlDataLoader
             models.TrackData(module, "ir.ui.menu", menuId, menuId, "menu");
         }
     }
+
+    // XML field text is always a string; Postgres columns are strictly typed (unlike the old
+    // SQLite/InMemory paths, which silently coerced), so cast to the field's real type here.
+    private static object ConvertXmlFieldValue(string raw, FieldDef? fdef) => fdef?.Type switch
+    {
+        FieldType.Integer or FieldType.Many2one => int.TryParse(raw, out var i) ? i : raw,
+        FieldType.Float => double.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d : raw,
+        FieldType.Boolean => raw.Equals("true", StringComparison.OrdinalIgnoreCase) || raw == "1",
+        _ => raw
+    };
 }
 
 public class OdooModuleLifecycleManager
@@ -953,22 +895,56 @@ public class OdooModuleLifecycleManager
 
     public List<OdooManifest> GetDiscoveredModules() => _discoveredManifests.Values.ToList();
 
-    public void SetModuleState(string technicalName, bool install)
+    // Returns null on success, or an error message when the change is blocked
+    // (matches Odoo cascading dependency install / blocking uninstall of a depended-upon module).
+    public string? SetModuleState(string technicalName, bool install)
     {
-        if (_discoveredManifests.TryGetValue(technicalName, out var manifest))
-        {
-            manifest.State = install ? "installed" : "uninstalled";
-            SavePersistedState();
+        if (!_discoveredManifests.TryGetValue(technicalName, out var manifest))
+            return $"Module '{technicalName}' not found";
 
-            if (!install)
+        if (install)
+        {
+            foreach (var dep in CollectTransitiveDeps(technicalName))
             {
-                _modelRegistry.DropModuleSchemaAndData(technicalName);
-                _viewRegistry.RemoveModuleViews(technicalName);
-                _menuRegistry.RemoveModuleMenus(technicalName);
+                if (_discoveredManifests.TryGetValue(dep, out var depManifest))
+                    depManifest.State = "installed";
             }
-            
-            RebuildActiveState();
+            manifest.State = "installed";
         }
+        else
+        {
+            var dependents = _discoveredManifests.Values
+                .Where(m => m.State == "installed" && m.TechnicalName != technicalName && m.Depends.Contains(technicalName))
+                .Select(m => m.Name)
+                .ToList();
+            if (dependents.Count > 0)
+                return $"Cannot uninstall '{manifest.Name}': required by {string.Join(", ", dependents)}";
+
+            manifest.State = "uninstalled";
+            _modelRegistry.DropModuleSchemaAndData(technicalName);
+            _viewRegistry.RemoveModuleViews(technicalName);
+            _menuRegistry.RemoveModuleMenus(technicalName);
+        }
+
+        SavePersistedState();
+        RebuildActiveState();
+        return null;
+    }
+
+    private IEnumerable<string> CollectTransitiveDeps(string technicalName)
+    {
+        var seen = new HashSet<string>();
+        void Walk(string name)
+        {
+            if (!_discoveredManifests.TryGetValue(name, out var m)) return;
+            foreach (var dep in m.Depends)
+            {
+                if (dep == "base") continue;
+                if (seen.Add(dep)) Walk(dep);
+            }
+        }
+        Walk(technicalName);
+        return seen;
     }
 
     public void RebuildActiveState()

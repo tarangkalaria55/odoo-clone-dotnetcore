@@ -24,6 +24,10 @@ function evalModifier(expr, record) {
 export function AppsManagerDashboard({ onAppToggled }) {
     const [apps, setApps] = useState([]);
     const [loading, setLoading] = useState(false);
+    const [search, setSearch] = useState('');
+    const [appFilter, setAppFilter] = useState('all');
+    const [stateFilter, setStateFilter] = useState('all');
+    const [error, setError] = useState(null);
 
     const loadApps = () => {
         fetch('/web/apps/list').then(res => res.json()).then(data => setApps(data));
@@ -33,56 +37,97 @@ export function AppsManagerDashboard({ onAppToggled }) {
 
     const toggleApp = async (technicalName, install) => {
         setLoading(true);
-        await fetch('/web/apps/toggle', {
+        setError(null);
+        const res = await fetch('/web/apps/toggle', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ technicalName, install })
         });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            setError(data.error || 'Failed to update module.');
+        }
         setLoading(false);
         loadApps();
         if (onAppToggled) onAppToggled();
     };
 
+    const q = search.trim().toLowerCase();
+    const filtered = apps.filter(app => {
+        if (appFilter === 'apps' && !app.application) return false;
+        if (appFilter === 'extra' && app.application) return false;
+        if (stateFilter === 'installed' && app.state !== 'installed') return false;
+        if (stateFilter === 'not_installed' && app.state === 'installed') return false;
+        if (q && !app.name.toLowerCase().includes(q) && !(app.summary || '').toLowerCase().includes(q) && !app.technicalName.toLowerCase().includes(q)) return false;
+        return true;
+    });
+
+    const grouped = {};
+    for (const app of filtered) (grouped[app.category || 'Uncategorized'] ??= []).push(app);
+    const categories = Object.keys(grouped).sort();
+
+    const filterBtn = (value, current, setter, label) => React.createElement('button', {
+        type: 'button',
+        className: `btn btn-sm ${current === value ? 'btn-secondary' : 'btn-outline-secondary'} me-1`,
+        onClick: () => setter(value)
+    }, label);
+
     return React.createElement('div', { className: 'container-fluid px-4 py-3' },
-        React.createElement('div', { className: 'd-flex justify-content-between align-items-center mb-4' },
+        React.createElement('div', { className: 'd-flex justify-content-between align-items-center mb-3' },
             React.createElement('h4', { className: 'fw-bold text-secondary m-0' }, '📦 Modular Apps Center'),
             loading ? React.createElement('div', { className: 'spinner-border spinner-border-sm text-primary' }) : null
         ),
-        React.createElement('div', { className: 'row g-3' },
-            apps.map(app => {
-                const isInstalled = app.state === 'installed';
-                return React.createElement('div', { key: app.technicalName, className: 'col-md-6 col-lg-3' },
-                    React.createElement('div', { className: 'app-card d-flex flex-column justify-content-between h-100' },
-                        React.createElement('div', null,
-                            React.createElement('div', { className: 'd-flex justify-content-between align-items-start mb-2' },
-                                React.createElement('h5', { className: 'fw-bold m-0 text-dark' }, app.name),
-                                React.createElement('span', { className: `badge ${isInstalled ? 'bg-success' : 'bg-secondary'}` },
-                                    isInstalled ? 'Installed' : 'Not Installed'
-                                )
+        error ? React.createElement('div', { className: 'alert alert-danger py-2' }, error) : null,
+        React.createElement('div', { className: 'd-flex flex-wrap align-items-center gap-2 mb-4' },
+            React.createElement('input', {
+                className: 'form-control form-control-sm', style: { maxWidth: 260 },
+                placeholder: 'Search apps...', value: search, onChange: e => setSearch(e.target.value)
+            }),
+            React.createElement('div', null, filterBtn('all', appFilter, setAppFilter, 'All'), filterBtn('apps', appFilter, setAppFilter, 'Apps'), filterBtn('extra', appFilter, setAppFilter, 'Extra')),
+            React.createElement('div', null, filterBtn('all', stateFilter, setStateFilter, 'Any Status'), filterBtn('installed', stateFilter, setStateFilter, 'Installed'), filterBtn('not_installed', stateFilter, setStateFilter, 'Not Installed'))
+        ),
+        categories.map(cat => React.createElement('div', { key: cat, className: 'mb-4' },
+            React.createElement('h6', { className: 'text-muted border-bottom pb-2 mb-3' }, `${cat} (${grouped[cat].length})`),
+            React.createElement('div', { className: 'row g-3' },
+                grouped[cat].map(app => {
+                    const isInstalled = app.state === 'installed';
+                    return React.createElement('div', { key: app.technicalName, className: 'col-md-6 col-lg-3' },
+                        React.createElement('div', { className: 'app-card d-flex flex-column justify-content-between h-100' },
+                            React.createElement('div', null,
+                                React.createElement('div', { className: 'd-flex justify-content-between align-items-start mb-2' },
+                                    React.createElement('h5', { className: 'fw-bold m-0 text-dark' }, app.name),
+                                    React.createElement('span', { className: `badge ${isInstalled ? 'bg-success' : 'bg-secondary'}` },
+                                        isInstalled ? 'Installed' : 'Not Installed'
+                                    )
+                                ),
+                                React.createElement('div', { className: 'small text-muted' }, `v${app.version} · By ${app.author}`),
+                                app.website ? React.createElement('a', { className: 'small', href: app.website, target: '_blank', rel: 'noreferrer' }, app.website) : null,
+                                React.createElement('p', { className: 'small text-secondary mt-2 mb-1' }, app.summary || 'No description.'),
+                                app.depends && app.depends.length > 0 ? React.createElement('div', { className: 'small text-muted' },
+                                    'Depends on: ', app.depends.join(', ')
+                                ) : null
                             ),
-                            React.createElement('div', { className: 'small text-muted mb-2' }, `Category: ${app.category}`),
-                            React.createElement('p', { className: 'small text-secondary' }, app.summary || 'No description.')
-                        ),
-                        React.createElement('div', { className: 'd-flex justify-content-between align-items-center mt-3 pt-3 border-top' },
-                            React.createElement('code', { className: 'small' }, app.technicalName),
-                            isInstalled ? (
-                                React.createElement('button', {
-                                    type: 'button',
-                                    className: 'btn btn-sm btn-outline-danger',
-                                    onClick: () => toggleApp(app.technicalName, false)
-                                }, React.createElement('i', { className: 'bi bi-x-circle me-1' }), 'Deactivate')
-                            ) : (
-                                React.createElement('button', {
-                                    type: 'button',
-                                    className: 'btn btn-sm btn-primary',
-                                    onClick: () => toggleApp(app.technicalName, true)
-                                }, React.createElement('i', { className: 'bi bi-download me-1' }), 'Activate')
+                            React.createElement('div', { className: 'd-flex justify-content-between align-items-center mt-3 pt-3 border-top' },
+                                React.createElement('code', { className: 'small' }, app.technicalName),
+                                isInstalled ? (
+                                    React.createElement('button', {
+                                        type: 'button',
+                                        className: 'btn btn-sm btn-outline-danger',
+                                        onClick: () => toggleApp(app.technicalName, false)
+                                    }, React.createElement('i', { className: 'bi bi-x-circle me-1' }), 'Deactivate')
+                                ) : (
+                                    React.createElement('button', {
+                                        type: 'button',
+                                        className: 'btn btn-sm btn-primary',
+                                        onClick: () => toggleApp(app.technicalName, true)
+                                    }, React.createElement('i', { className: 'bi bi-download me-1' }), 'Activate')
+                                )
                             )
                         )
-                    )
-                );
-            })
-        )
+                    );
+                })
+            )
+        ))
     );
 }
 
@@ -348,6 +393,10 @@ function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
             if (btnType === 'object') {
                 await callKw(model, btnName, [recordId || 0, record]);
                 await loadData();
+            } else if (btnType === 'report') {
+                if (!recordId) { setErrorMsg('Save the record before printing.'); return; }
+                const template = btnNode.getAttribute('template');
+                window.open(`/web/report/${encodeURIComponent(model)}/${encodeURIComponent(template)}/${recordId}`, '_blank');
             }
         } catch (e) { setErrorMsg(e.message); }
     };
@@ -665,18 +714,13 @@ function WebClient({ user, onLogout }) {
     const [selectedRecordId, setSelectedRecordId] = useState(null);
     const [domain, setDomain] = useState([]);
 
-    const VIEW_TYPE_TO_URL = { tree: 'list', kanban: 'kanban', form: 'form' };
-    const VIEW_TYPE_FROM_URL = { list: 'tree', kanban: 'kanban', form: 'form' };
-
     const parseHash = () => {
-        const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
-        const menuId = parseInt(params.get('menu_id'));
-        if (!menuId) return null;
-        const id = params.get('id');
+        const match = window.location.hash.match(/^#\/app\/(\d+)(?:\/(tree|kanban|form))?(?:\/(new|\d+))?$/);
+        if (!match) return null;
         return {
-            menuId,
-            viewMode: VIEW_TYPE_FROM_URL[params.get('view_type')] || 'tree',
-            recordId: id ? parseInt(id) : null
+            menuId: parseInt(match[1]),
+            viewMode: match[2] || 'tree',
+            recordId: match[3] && match[3] !== 'new' ? parseInt(match[3]) : null
         };
     };
 
@@ -691,13 +735,9 @@ function WebClient({ user, onLogout }) {
     };
 
     const navigate = (menuId, mode = 'tree', recordId = null) => {
-        const menu = menus.find(m => m.id === menuId);
-        const params = new URLSearchParams();
-        params.set('menu_id', menuId);
-        if (menu?.targetModel) params.set('model', menu.targetModel);
-        params.set('view_type', VIEW_TYPE_TO_URL[mode] || mode);
-        if (mode === 'form' && recordId) params.set('id', recordId);
-        window.location.hash = params.toString();
+        let h = `#/app/${menuId}/${mode}`;
+        if (mode === 'form') h += `/${recordId ?? 'new'}`;
+        window.location.hash = h;
     };
 
     const loadSessionMenus = () => {

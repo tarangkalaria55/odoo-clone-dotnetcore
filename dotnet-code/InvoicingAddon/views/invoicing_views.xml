@@ -30,6 +30,45 @@
             </field>
         </record>
 
+        <record id="account.report_move" model="ir.ui.view">
+            <field name="name">account.move.report</field>
+            <field name="model">account.move</field>
+            <field name="arch" type="xml">
+                <t t-name="account.move.report">
+                    <html>
+                        <head>
+                            <style>
+                                body { font-family: sans-serif; padding: 2rem; color: #222; }
+                                table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+                                th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+                                th { background: #f5f5f5; }
+                                .total { text-align: right; margin-top: 1rem; font-size: 1.2rem; }
+                            </style>
+                        </head>
+                        <body>
+                            <h2 t-esc="record.name"/>
+                            <p>Bill To: <span t-esc="record.partner_id"/></p>
+                            <p>Status: <span t-esc="record.status"/></p>
+                            <table>
+                                <thead>
+                                    <tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Subtotal</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr t-foreach="record.invoice_line_ids" t-as="line">
+                                        <td t-esc="line.name"/>
+                                        <td t-esc="line.quantity"/>
+                                        <td t-esc="line.price_unit"/>
+                                        <td t-esc="line.price_subtotal"/>
+                                    </tr>
+                                </tbody>
+                            </table>
+                            <div class="total">Total: <span t-esc="record.amount_total"/></div>
+                        </body>
+                    </html>
+                </t>
+            </field>
+        </record>
+
         <record id="account.view_move_form" model="ir.ui.view">
             <field name="name">account.move.form</field>
             <field name="model">account.move</field>
@@ -37,6 +76,7 @@
                 <form string="Invoice">
                     <header>
                         <button name="ActionPost" string="Post" type="object" class="btn-success" invisible="status != 'draft'"/>
+                        <button string="Print" type="report" template="account.report_move" class="btn-outline-secondary"/>
                     </header>
                     <sheet>
                         <group string="Details">

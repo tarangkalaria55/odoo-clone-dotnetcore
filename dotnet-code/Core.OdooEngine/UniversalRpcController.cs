@@ -40,6 +40,12 @@ public class UniversalRpcController(
         return raw.ToDictionary(kv => kv.Key, kv => UnwrapJson(kv.Value)!);
     }
 
+    private static List<List<object>> DeserializeDomain(JsonElement el)
+    {
+        var raw = JsonSerializer.Deserialize<List<List<JsonElement>>>(el.GetRawText())!;
+        return raw.Select(clause => clause.Select(e => UnwrapJson(e)!).ToList()).ToList();
+    }
+
     [AllowAnonymous]
     [HttpPost("/web/session/login")]
     public async Task<IActionResult> Login([FromBody] LoginRequest req)
@@ -98,8 +104,22 @@ public class UniversalRpcController(
 
         var techName = body.GetProperty("technicalName").GetString()!;
         var install = body.GetProperty("install").GetBoolean();
-        lifecycleManager.SetModuleState(techName, install);
+        var error = lifecycleManager.SetModuleState(techName, install);
+        if (error != null) return BadRequest(new { error });
         return Ok(new { status = "success" });
+    }
+
+    [HttpGet("/web/report/{model}/{template}/{id:int}")]
+    public IActionResult RenderReport(string model, string template, int id)
+    {
+        var arch = views.GetRawArch(template);
+        if (arch == null) return NotFound(new { error = $"Template '{template}' not found" });
+
+        var records = models.SearchRead(model, null, [["id", "=", id]]);
+        if (records.Count == 0) return NotFound(new { error = $"Record #{id} not found" });
+
+        var ctx = new Dictionary<string, object?> { ["record"] = records[0] };
+        return Content(QwebEngine.Render(arch, ctx), "text/html");
     }
 
     [HttpGet("/web/mail/chatter/{model}/{id}")]
@@ -141,7 +161,7 @@ public class UniversalRpcController(
                     
                     List<List<object>>? domain = null;
                     if (req.Kwargs.TryGetProperty("domain", out var domElem))
-                        domain = JsonSerializer.Deserialize<List<List<object>>>(domElem.GetRawText());
+                        domain = DeserializeDomain(domElem);
 
                     var results = models.SearchRead(req.Model, fieldList, domain);
                     if (req.Model == "res.users") foreach (var r in results) r.Remove("password_hash");
