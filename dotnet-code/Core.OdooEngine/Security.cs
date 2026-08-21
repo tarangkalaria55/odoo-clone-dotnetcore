@@ -13,6 +13,7 @@ public class BaseUserModel : OdooModel
         AddField("password_hash", FieldType.Char, "Password Hash", module: "base");
         AddField("active", FieldType.Boolean, "Active", defaultValue: true, module: "base");
         AddField("group_ids", FieldType.Many2many, "Groups", relation: "res.groups", module: "base");
+        AddSqlConstraint("res_users_login_uniq", ["login"], "This login is already taken.");
     }
 }
 

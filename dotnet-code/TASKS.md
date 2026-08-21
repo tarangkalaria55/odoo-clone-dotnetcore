@@ -174,6 +174,40 @@ in code too).
       touches - a much larger architectural change than batch create
       itself, so deliberately not attempted in this pass.
 
+- [x] **`_sql_constraints`** (`odoo/orm/models.py` `_add_sql_constraints`)
+      — `OdooModel.AddSqlConstraint(name, fields, message)` declares a real
+      Postgres `UNIQUE` constraint (not a check-then-insert — actually
+      race-free, matching how Odoo relies on the DB constraint itself).
+      Applied in `AutoSyncPhysicalDatabase` (swallowing the duplicate-name
+      error on repeat syncs, same idempotent style as `ADD COLUMN`).
+      `Create`/`Write` catch Postgres's unique-violation (`SqlState
+      23505`) and translate it via `TranslateUniqueViolation`, matching
+      the constraint by `PostgresException.ConstraintName` to the declared
+      friendly message. First real usage: `res_users_login_uniq` on
+      `res.users.login`.
+
+- [x] **`create_uid`/`write_uid`** (`odoo/orm/models.py` `MetaModel`) —
+      added as universal `Many2one → res.users` fields (self-referential
+      on `res.users` itself, which Many2one handles fine — unlike
+      Many2many's join-table column-collision issue, a single id column
+      has no such problem). `Create`/`Write`/`Copy`/`CreateMulti` all gained
+      an optional `int? uid` parameter, server-set and never client-
+      overridable (same pattern as `create_date`/`write_date`); `null`
+      (system/seed calls) leaves them unset rather than faking an author.
+      `UniversalRpcController.CurrentUserId` reads `ClaimTypes.NameIdentifier`
+      from the logged-in user's cookie and passes it through on `create`/
+      `write`/`copy`. This was the actual "current user" threading
+      prerequisite the `sudo()` item (see out-of-scope section) also
+      needs — that's still separately unimplemented, but the plumbing
+      pattern now exists to build it on.
+
+      Both verified live against Postgres: creating a record resolves
+      `create_uid`/`write_uid` to `[1,"Administrator"]` via the normal
+      Many2one projection; a subsequent `write` updates `write_uid`
+      (leaves `create_uid` untouched); attempting to create a second
+      `res.users` with an existing `login` gets `"This login is already
+      taken."` (400) instead of a raw Postgres constraint error.
+
 ## In progress / next up (priority order, core framework only)
 
 1. [ ] **X2many write-commands** (`odoo/orm/commands.py`, the
@@ -196,17 +230,10 @@ in code too).
        `Many2one` `ondelete=`) — `Unlink()` has no FK-safety net; deleting
        a referenced row either orphans child rows or throws a raw Postgres
        FK-violation exception instead of a friendly error / cascade.
-4. [ ] **`_sql_constraints`** (`models.py` `_add_sql_constraints`) —
-       declarative unique/check constraints with friendly error text
-       instead of a raw Postgres unique-violation.
-5. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
+4. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
        `IOdooAddon` has no lifecycle callback beyond `RegisterModels` for
        one-time data seeding/migration on install or cleanup on uninstall.
-6. [ ] **`create_uid`/`write_uid`** (`models.py` `MetaModel`) — needs a
-       "current user" context threaded through `ModelRegistry` CRUD calls
-       from `UniversalRpcController`'s `HttpContext.User`; same prerequisite
-       as `sudo()`/superuser escalation (see out-of-scope section).
-7. [ ] **`any`/`not any` domain operator** — relational sub-domain
+5. [ ] **`any`/`not any` domain operator** — relational sub-domain
        matching, e.g. `[('invoice_line_ids','any',[('price_unit','>',100)])]`.
        Depends on #2 (domain tree) landing first. Lower priority than the
        above; genuinely needs a related-model subquery-style evaluation.
@@ -273,9 +300,12 @@ Confirmed via a full survey of `odoo/orm/`, `odoo/osv/`, `odoo/api/`,
   `RedirectWarning` — no field-cache layer, no pessimistic locking, and no
   action-redirect UI concept exist here to make these meaningful yet.
 - `orm/environments.py` `sudo()`/superuser context escalation — real gap,
-  but would replace the `AdminOnlyModels` hardcoding with a `bool asAdmin`
-  threaded through `ModelRegistry` CRUD; deferred until `ir.model.access`-
-  style per-model ACLs exist (currently addons-scoped, out of scope).
+  would replace the `AdminOnlyModels` hardcoding with a `bool asAdmin`
+  threaded through `ModelRegistry` CRUD. The "current user" threading
+  prerequisite this needed now exists (`create_uid`/`write_uid`'s `uid`
+  parameter proved the pattern) - `sudo()` itself is still deferred until
+  `ir.model.access`-style per-model ACLs exist (currently addons-scoped,
+  out of scope), since a bypass flag needs real ACLs to bypass.
 - CLI (`cli/`), test suites (`tests/`), upgrade scripts (`upgrade/`,
   `upgrade_code/`) — not applicable to this project's shape.
 - Multi-provider database abstraction — deliberately removed, not just

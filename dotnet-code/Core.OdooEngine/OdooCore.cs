@@ -120,11 +120,20 @@ public record FieldDef(
 public record MailMessage(int Id, string Model, int RecordId, string Author, string Body, string Date, string Type);
 public record ModelDataEntry(string Module, string Model, string Name, string ResId, string Type);
 
+public record SqlConstraintDef(string Name, string[] Fields, string Message);
+
 public abstract class OdooModel
 {
     public abstract string Name { get; }
     public virtual string Inherit => string.Empty;
     public Dictionary<string, FieldDef> Fields { get; } = new();
+    public List<SqlConstraintDef> SqlConstraints { get; } = new();
+
+    // Mirrors Odoo's _sql_constraints: a real Postgres UNIQUE constraint (so it's actually
+    // race-free, not a check-then-insert) whose violation gets translated into `message`
+    // instead of a raw Postgres error. odoo/orm/models.py `_add_sql_constraints`.
+    public void AddSqlConstraint(string name, string[] fields, string message) =>
+        SqlConstraints.Add(new SqlConstraintDef(name, fields, message));
 
     public void AddField(
         string name,
@@ -336,7 +345,7 @@ public class DatabaseAdapter
     public (string Table, string ColA, string ColB) ManyToManyTable(string model, string fieldName, string relation) =>
         ($"{Sanitize(model)}_{Sanitize(fieldName)}_rel", $"{Sanitize(model)}_id", $"{Sanitize(relation)}_id");
 
-    public void AutoSyncPhysicalDatabase(Dictionary<string, Dictionary<string, FieldDef>> desiredModels)
+    public void AutoSyncPhysicalDatabase(Dictionary<string, Dictionary<string, FieldDef>> desiredModels, Dictionary<string, List<SqlConstraintDef>>? desiredConstraints = null)
     {
         using var conn = CreateConnection();
         conn.Open();
@@ -359,6 +368,17 @@ public class DatabaseAdapter
 
                 var colType = MapSqlType(fdef.Type);
                 try { conn.Execute($"ALTER TABLE {Quote(tbl)} ADD COLUMN IF NOT EXISTS {Quote(fname)} {colType};"); } catch { }
+            }
+
+            if (desiredConstraints != null && desiredConstraints.TryGetValue(modelName, out var constraints))
+            {
+                foreach (var c in constraints)
+                {
+                    var cols = string.Join(", ", c.Fields.Select(Quote));
+                    // Postgres has no "ADD CONSTRAINT IF NOT EXISTS" - swallow the duplicate-name
+                    // error on every subsequent sync, same pattern as ADD COLUMN above.
+                    try { conn.Execute($"ALTER TABLE {Quote(tbl)} ADD CONSTRAINT {Quote(c.Name)} UNIQUE ({cols});"); } catch { }
+                }
             }
         }
     }
@@ -384,6 +404,7 @@ public class ModelRegistry
 {
     private readonly Dictionary<string, List<OdooModel>> _registeredModelExtensions = new();
     private readonly Dictionary<string, Dictionary<string, FieldDef>> _activeSchema = new();
+    private readonly Dictionary<string, List<SqlConstraintDef>> _activeConstraints = new();
     private readonly List<ModelDataEntry> _modelData = new();
     private readonly List<MailMessage> _mailMessages = new();
     private readonly DatabaseAdapter _db;
@@ -413,6 +434,7 @@ public class ModelRegistry
     public void AutoSyncSchema()
     {
         var desiredSchema = new Dictionary<string, Dictionary<string, FieldDef>>();
+        var desiredConstraints = new Dictionary<string, List<SqlConstraintDef>>();
 
         foreach (var (modelName, modelDefs) in _registeredModelExtensions)
         {
@@ -424,19 +446,26 @@ public class ModelRegistry
                 // for `active` lives in SearchRead.
                 ["active"] = new FieldDef("active", FieldType.Boolean, "Active", DefaultValue: true, Module: "base"),
                 ["create_date"] = new FieldDef("create_date", FieldType.DateTime, "Created On", Readonly: true, Module: "base"),
-                ["write_date"] = new FieldDef("write_date", FieldType.DateTime, "Last Updated On", Readonly: true, Module: "base")
+                ["write_date"] = new FieldDef("write_date", FieldType.DateTime, "Last Updated On", Readonly: true, Module: "base"),
+                ["create_uid"] = new FieldDef("create_uid", FieldType.Many2one, "Created By", Relation: "res.users", Readonly: true, Module: "base"),
+                ["write_uid"] = new FieldDef("write_uid", FieldType.Many2one, "Last Updated By", Relation: "res.users", Readonly: true, Module: "base")
             };
 
+            var constraints = new List<SqlConstraintDef>();
             foreach (var def in modelDefs)
             {
                 foreach (var (fName, fDef) in def.Fields) merged[fName] = fDef;
+                constraints.AddRange(def.SqlConstraints);
             }
             desiredSchema[modelName] = merged;
+            desiredConstraints[modelName] = constraints;
         }
 
         _activeSchema.Clear();
+        _activeConstraints.Clear();
         foreach (var (m, f) in desiredSchema) _activeSchema[m] = new Dictionary<string, FieldDef>(f);
-        _db.AutoSyncPhysicalDatabase(desiredSchema);
+        foreach (var (m, c) in desiredConstraints) _activeConstraints[m] = c;
+        _db.AutoSyncPhysicalDatabase(desiredSchema, desiredConstraints);
     }
 
     public void DropModuleSchemaAndData(string moduleName)
@@ -478,6 +507,16 @@ public class ModelRegistry
 
     public Dictionary<string, FieldDef> GetFields(string model) =>
         _activeSchema.TryGetValue(model, out var fields) ? fields : new();
+
+    // Translates a raw Postgres unique-violation into the friendly message declared via
+    // AddSqlConstraint, matching odoo/orm/models.py's `_sql_error_to_message`.
+    private ValidationError TranslateUniqueViolation(string model, PostgresException pgEx)
+    {
+        var message = _activeConstraints.TryGetValue(model, out var constraints)
+            ? constraints.FirstOrDefault(c => c.Name == pgEx.ConstraintName)?.Message
+            : null;
+        return new ValidationError(message ?? "This value must be unique; a record with it already exists.");
+    }
 
     // `model` comes straight from the RPC request body (UniversalRpcController.CallKw), and the
     // table name below is interpolated into raw SQL (Dapper can't parameterize identifiers).
@@ -690,7 +729,7 @@ public class ModelRegistry
         }
     }
 
-    public int Create(string model, Dictionary<string, object> values, IDbTransaction? tx = null)
+    public int Create(string model, Dictionary<string, object> values, IDbTransaction? tx = null, int? uid = null)
     {
         EnsureModelExists(model);
         var modelFields = GetFields(model);
@@ -718,6 +757,10 @@ public class ModelRegistry
         var now = DateTime.UtcNow;
         if (modelFields.ContainsKey("create_date")) record["create_date"] = now;
         if (modelFields.ContainsKey("write_date")) record["write_date"] = now;
+        // uid is null for system/internal calls (demo data, seeding) - leave create_uid/write_uid
+        // unset (NULL) rather than faking an author, same as real Odoo has no user during bootstrap.
+        if (uid != null && modelFields.ContainsKey("create_uid")) record["create_uid"] = uid.Value;
+        if (uid != null && modelFields.ContainsKey("write_uid")) record["write_uid"] = uid.Value;
 
         ValidateFieldValues(modelFields, record, requireAll: true);
 
@@ -746,6 +789,10 @@ public class ModelRegistry
             foreach (var col in cols) parameters.Add(col, record[col]);
             newId = conn.ExecuteScalar<int>(sql, parameters, tx);
         }
+        catch (PostgresException pgEx) when (pgEx.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            throw TranslateUniqueViolation(model, pgEx);
+        }
         finally { if (owned) conn.Dispose(); }
 
         foreach (var (fname, fdef) in modelFields)
@@ -765,10 +812,10 @@ public class ModelRegistry
     // insert fast path (no need for one here at this project's scale). Wrapped in one
     // transaction so a failure partway through the batch rolls back everything already
     // inserted, instead of leaving earlier rows committed.
-    public List<int> CreateMulti(string model, List<Dictionary<string, object>> valuesList) =>
-        RunInTransaction(tx => valuesList.Select(v => Create(model, v, tx)).ToList());
+    public List<int> CreateMulti(string model, List<Dictionary<string, object>> valuesList, int? uid = null) =>
+        RunInTransaction(tx => valuesList.Select(v => Create(model, v, tx, uid)).ToList());
 
-    public bool Write(string model, int id, Dictionary<string, object> values, IDbTransaction? tx = null)
+    public bool Write(string model, int id, Dictionary<string, object> values, IDbTransaction? tx = null, int? uid = null)
     {
         EnsureModelExists(model);
         var modelFields = GetFields(model);
@@ -790,7 +837,9 @@ public class ModelRegistry
         }
 
         recordValues.Remove("create_date"); // set once at creation, never client-settable
+        recordValues.Remove("create_uid"); // ditto
         if (modelFields.ContainsKey("write_date")) recordValues["write_date"] = DateTime.UtcNow;
+        if (uid != null && modelFields.ContainsKey("write_uid")) recordValues["write_uid"] = uid.Value;
 
         ValidateFieldValues(modelFields, recordValues, requireAll: false);
 
@@ -818,6 +867,10 @@ public class ModelRegistry
 
             affected = conn.Execute(sql, parameters, tx);
         }
+        catch (PostgresException pgEx) when (pgEx.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            throw TranslateUniqueViolation(model, pgEx);
+        }
         finally { if (owned) conn.Dispose(); }
 
         if (affected == 0)
@@ -835,7 +888,7 @@ public class ModelRegistry
 
     // Mirrors Odoo's copy()/duplicate: a shallow clone (child One2many lines are not copied,
     // matching a "new draft from this one" duplicate rather than a deep recursive clone).
-    public int Copy(string model, int id)
+    public int Copy(string model, int id, int? uid = null)
     {
         EnsureModelExists(model);
         var source = SearchRead(model, null, [["id", "=", id]]).FirstOrDefault()
@@ -845,11 +898,11 @@ public class ModelRegistry
         var copyValues = new Dictionary<string, object>();
         foreach (var (fname, fdef) in modelFields)
         {
-            if (fname is "id" or "create_date" or "write_date" || fdef.Type == FieldType.One2many) continue;
+            if (fname is "id" or "create_date" or "write_date" or "create_uid" or "write_uid" || fdef.Type == FieldType.One2many) continue;
             if (!source.TryGetValue(fname, out var v) || v == null) continue;
             copyValues[fname] = fdef.Type == FieldType.Many2one && v is object[] arr ? arr[0] : v;
         }
-        return Create(model, copyValues);
+        return Create(model, copyValues, uid: uid);
     }
 
     public bool Unlink(string model, int id, IDbTransaction? tx = null)

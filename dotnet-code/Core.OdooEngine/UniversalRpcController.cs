@@ -23,6 +23,8 @@ public class UniversalRpcController(
 {
     private static readonly HashSet<string> AdminOnlyModels = new() { "res.users", "res.groups" };
 
+    private int? CurrentUserId => int.TryParse(User.FindFirst(ClaimTypes.NameIdentifier)?.Value, out var id) ? id : null;
+
     private static object? UnwrapJson(JsonElement el) => el.ValueKind switch
     {
         JsonValueKind.String => el.GetString(),
@@ -179,21 +181,21 @@ public class UniversalRpcController(
                     if (req.Args[0].ValueKind == JsonValueKind.Array)
                     {
                         var valuesList = req.Args[0].EnumerateArray().Select(DeserializeValues).ToList();
-                        return Ok(models.CreateMulti(req.Model, valuesList));
+                        return Ok(models.CreateMulti(req.Model, valuesList, uid: CurrentUserId));
                     }
                     var createValues = DeserializeValues(req.Args[0]);
-                    return Ok(models.Create(req.Model, createValues));
+                    return Ok(models.Create(req.Model, createValues, uid: CurrentUserId));
 
                 case "write":
                     var id = req.Args[0].GetInt32();
                     var writeValues = DeserializeValues(req.Args[1]);
-                    return Ok(models.Write(req.Model, id, writeValues));
+                    return Ok(models.Write(req.Model, id, writeValues, uid: CurrentUserId));
 
                 case "unlink":
                     return Ok(models.Unlink(req.Model, req.Args[0].GetInt32()));
 
                 case "copy":
-                    return Ok(models.Copy(req.Model, req.Args[0].GetInt32()));
+                    return Ok(models.Copy(req.Model, req.Args[0].GetInt32(), uid: CurrentUserId));
 
                 case "name_search":
                     var allRelational = models.SearchRead(req.Model, ["id", "name"]);
