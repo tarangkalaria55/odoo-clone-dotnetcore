@@ -98,7 +98,9 @@ public class OdooManifest
     public string FolderPath { get; set; } = string.Empty;
 }
 
-public enum FieldType { Char, Integer, Float, Boolean, Selection, Many2one, One2many, DateTime, Text }
+// Many2many appended last (not alphabetically) so existing numeric type codes (5=Many2one,
+// 6=One2many, etc.) already hardcoded in webclient.js don't shift.
+public enum FieldType { Char, Integer, Float, Boolean, Selection, Many2one, One2many, DateTime, Text, Many2many }
 public record SelectionOption(string Value, string Label);
 
 public record FieldDef(
@@ -311,7 +313,10 @@ public class DatabaseAdapter
 
     public string Sanitize(string modelName) => modelName.Replace(".", "_").ToLower();
 
-    public string Quote(string identifier) => $"\"{identifier}\"";
+    // Doubling an embedded quote is how Postgres escapes it inside a quoted identifier - this
+    // alone isn't the injection fix (identifiers here should never be attacker-controlled once
+    // ModelRegistry.EnsureModelExists validates `model` first), it's defense-in-depth.
+    public string Quote(string identifier) => $"\"{identifier.Replace("\"", "\"\"")}\"";
 
     public string MapSqlType(FieldType type) => type switch
     {
@@ -322,6 +327,14 @@ public class DatabaseAdapter
         FieldType.Many2one => "INT",
         _ => "TEXT"
     };
+
+    // Odoo auto-generates a join table per many2many field (odoo/orm/fields_relational.py
+    // Many2many._define_relation_table); we do the same, deriving the name from (model, field)
+    // rather than adding new AddField parameters. Not safe for a self-referential m2m (model ==
+    // relation would collide the two id columns) - not used anywhere in this codebase, so left
+    // unhandled rather than adding untested complexity for it.
+    public (string Table, string ColA, string ColB) ManyToManyTable(string model, string fieldName, string relation) =>
+        ($"{Sanitize(model)}_{Sanitize(fieldName)}_rel", $"{Sanitize(model)}_id", $"{Sanitize(relation)}_id");
 
     public void AutoSyncPhysicalDatabase(Dictionary<string, Dictionary<string, FieldDef>> desiredModels)
     {
@@ -336,6 +349,14 @@ public class DatabaseAdapter
             foreach (var (fname, fdef) in fields)
             {
                 if (fname == "id" || fdef.Type == FieldType.One2many) continue;
+
+                if (fdef.Type == FieldType.Many2many)
+                {
+                    var (joinTbl, colA, colB) = ManyToManyTable(modelName, fname, fdef.Relation!);
+                    conn.Execute($@"CREATE TABLE IF NOT EXISTS {Quote(joinTbl)} ({Quote(colA)} INT NOT NULL, {Quote(colB)} INT NOT NULL, PRIMARY KEY ({Quote(colA)}, {Quote(colB)}));");
+                    continue;
+                }
+
                 var colType = MapSqlType(fdef.Type);
                 try { conn.Execute($"ALTER TABLE {Quote(tbl)} ADD COLUMN IF NOT EXISTS {Quote(fname)} {colType};"); } catch { }
             }
@@ -397,7 +418,13 @@ public class ModelRegistry
         {
             var merged = new Dictionary<string, FieldDef>
             {
-                ["id"] = new FieldDef("id", FieldType.Integer, "ID", Module: "base")
+                ["id"] = new FieldDef("id", FieldType.Integer, "ID", Module: "base"),
+                // Universal audit/soft-delete columns every model gets, mirroring Odoo's
+                // magic fields (odoo/orm/models.py MetaModel) - active_test default filtering
+                // for `active` lives in SearchRead.
+                ["active"] = new FieldDef("active", FieldType.Boolean, "Active", DefaultValue: true, Module: "base"),
+                ["create_date"] = new FieldDef("create_date", FieldType.DateTime, "Created On", Readonly: true, Module: "base"),
+                ["write_date"] = new FieldDef("write_date", FieldType.DateTime, "Last Updated On", Readonly: true, Module: "base")
             };
 
             foreach (var def in modelDefs)
@@ -452,8 +479,23 @@ public class ModelRegistry
     public Dictionary<string, FieldDef> GetFields(string model) =>
         _activeSchema.TryGetValue(model, out var fields) ? fields : new();
 
+    // `model` comes straight from the RPC request body (UniversalRpcController.CallKw), and the
+    // table name below is interpolated into raw SQL (Dapper can't parameterize identifiers).
+    // Column names are already safe (filtered against the known field set), but without this
+    // check an attacker-chosen `model` string would be spliced directly into FROM/INTO/UPDATE/
+    // DELETE - e.g. model = "x\" WHERE 1=1; DROP TABLE res_users;--" breaks out of the quoted
+    // identifier. Validating against the real, server-defined model registry closes that off
+    // at the one place every CRUD entry point routes through, matching Odoo's own
+    // odoo/service/model.py execute_cr: "if recs is None: raise UserError(...)".
+    private void EnsureModelExists(string model)
+    {
+        if (!_activeSchema.ContainsKey(model))
+            throw new UserError($"Object {model} doesn't exist");
+    }
+
     public List<Dictionary<string, object>> SearchRead(string model, List<string>? fields = null, List<List<object>>? domain = null)
     {
+        EnsureModelExists(model);
         var modelFields = GetFields(model);
         List<Dictionary<string, object>> records;
 
@@ -508,6 +550,14 @@ public class ModelRegistry
             }
         }
 
+        // Odoo's active_test: rows with active=false are hidden unless the caller's domain
+        // already asks about `active` explicitly (e.g. [['active','=',false]] to see archived
+        // ones). Legacy rows with no `active` column value yet (NULL) count as active.
+        if (modelFields.ContainsKey("active") && (domain == null || !domain.Any(c => c.Count > 0 && c[0]?.ToString() == "active")))
+        {
+            filtered = filtered.Where(r => !(r.TryGetValue("active", out var a) && a is false));
+        }
+
         return filtered.Select(r =>
         {
             var projection = new Dictionary<string, object>();
@@ -515,23 +565,27 @@ public class ModelRegistry
 
             foreach (var f in targetFields)
             {
-                if (r.TryGetValue(f, out var val))
+                modelFields.TryGetValue(f, out var fdef);
+
+                // Many2many/One2many data never lives as a column on this row at all (it's in a
+                // join table / the related model), so these must be resolved before the raw
+                // r.TryGetValue(f, ...) column lookup below, not inside it.
+                if (fdef?.Type == FieldType.Many2many)
                 {
-                    if (modelFields.TryGetValue(f, out var fdef))
+                    projection[f] = GetMany2manyValues(model, f, fdef, Convert.ToInt32(r["id"]));
+                }
+                else if (fdef?.Type == FieldType.One2many)
+                {
+                    projection[f] = SearchRead(fdef.Relation!, null, [[fdef.InverseName!, "=", Convert.ToInt32(r["id"])]]);
+                }
+                else if (r.TryGetValue(f, out var val))
+                {
+                    if (fdef?.Type == FieldType.Many2one && val != null)
                     {
-                        if (fdef.Type == FieldType.Many2one && val != null)
-                        {
-                            var relId = Convert.ToInt32(val);
-                            var relSearch = SearchRead(fdef.Relation!, ["id", "name"], [["id", "=", relId]]);
-                            var relName = relSearch.Count > 0 && relSearch[0].TryGetValue("name", out var n) ? n.ToString() : $"#{relId}";
-                            projection[f] = new object[] { relId, relName ?? "" };
-                        }
-                        else if (fdef.Type == FieldType.One2many)
-                        {
-                            var childLines = SearchRead(fdef.Relation!, null, [[fdef.InverseName!, "=", Convert.ToInt32(r["id"])]]);
-                            projection[f] = childLines;
-                        }
-                        else projection[f] = val;
+                        var relId = Convert.ToInt32(val);
+                        var relSearch = SearchRead(fdef.Relation!, ["id", "name"], [["id", "=", relId]]);
+                        var relName = relSearch.Count > 0 && relSearch[0].TryGetValue("name", out var n) ? n.ToString() : $"#{relId}";
+                        projection[f] = new object[] { relId, relName ?? "" };
                     }
                     else projection[f] = val;
                 }
@@ -540,6 +594,45 @@ public class ModelRegistry
             if (r.TryGetValue("id", out var idVal)) projection["id"] = idVal;
             return projection;
         }).ToList();
+    }
+
+    private List<object[]> GetMany2manyValues(string model, string fieldName, FieldDef fdef, int recordId)
+    {
+        var (joinTbl, colA, colB) = _db.ManyToManyTable(model, fieldName, fdef.Relation!);
+        List<int> ids;
+        using (var conn = _db.CreateConnection())
+        {
+            conn.Open();
+            ids = conn.Query<int>($"SELECT {_db.Quote(colB)} FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id = recordId }).ToList();
+        }
+        if (ids.Count == 0) return new();
+
+        var related = SearchRead(fdef.Relation!, ["id", "name"], [["id", "in", ids.Cast<object>().ToList()]]);
+        return related.Select(rr => new object[] { rr["id"], rr.TryGetValue("name", out var n) ? n : $"#{rr["id"]}" }).ToList();
+    }
+
+    // Client sends either raw ids ([1,2,3]) or, if round-tripping a previous read, [id,name]
+    // tuples ([[1,"Admin"],[2,"User"]]) - accept both.
+    private static List<int> ExtractMany2manyIds(object? value) => value switch
+    {
+        System.Collections.IEnumerable list and not string => list.Cast<object?>()
+            .Select(item => item is System.Collections.IEnumerable inner and not string ? inner.Cast<object?>().FirstOrDefault() : item)
+            .Where(x => x != null)
+            .Select(x => Convert.ToInt32(x))
+            .ToList(),
+        _ => new List<int>()
+    };
+
+    private void SyncMany2many(string model, string fieldName, FieldDef fdef, int recordId, object? rawValue)
+    {
+        var ids = ExtractMany2manyIds(rawValue);
+        var (joinTbl, colA, colB) = _db.ManyToManyTable(model, fieldName, fdef.Relation!);
+
+        using var conn = _db.CreateConnection();
+        conn.Open();
+        conn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id = recordId });
+        foreach (var relId in ids)
+            conn.Execute($"INSERT INTO {_db.Quote(joinTbl)} ({_db.Quote(colA)}, {_db.Quote(colB)}) VALUES (@a, @b)", new { a = recordId, b = relId });
     }
 
     // Mirrors what real Odoo surfaces as a friendly ValidationError instead of a raw
@@ -565,6 +658,7 @@ public class ModelRegistry
 
     public int Create(string model, Dictionary<string, object> values)
     {
+        EnsureModelExists(model);
         var modelFields = GetFields(model);
         var record = new Dictionary<string, object>(values);
 
@@ -586,6 +680,11 @@ public class ModelRegistry
             }
         }
 
+        // Server-set, never client-settable - always overwrite whatever the caller sent.
+        var now = DateTime.UtcNow;
+        if (modelFields.ContainsKey("create_date")) record["create_date"] = now;
+        if (modelFields.ContainsKey("write_date")) record["write_date"] = now;
+
         ValidateFieldValues(modelFields, record, requireAll: true);
 
         if (_registeredModelExtensions.TryGetValue(model, out var extensions))
@@ -603,7 +702,7 @@ public class ModelRegistry
         {
             conn.Open();
             var tbl = _db.Sanitize(model);
-            var cols = record.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type != FieldType.One2many).ToList();
+            var cols = record.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type is not (FieldType.One2many or FieldType.Many2many)).ToList();
             var colNames = string.Join(", ", cols.Select(c => _db.Quote(c)));
             var paramNames = string.Join(", ", cols.Select(c => "@" + c));
 
@@ -614,6 +713,12 @@ public class ModelRegistry
             newId = conn.ExecuteScalar<int>(sql, parameters);
         }
 
+        foreach (var (fname, fdef) in modelFields)
+        {
+            if (fdef.Type == FieldType.Many2many && record.TryGetValue(fname, out var m2mVal))
+                SyncMany2many(model, fname, fdef, newId, m2mVal);
+        }
+
         LogMessage(model, newId, "System", "Record created", "notification");
         _logger.LogInformation("Record #{Id} created on model {Model}", newId, model);
         return newId;
@@ -621,6 +726,7 @@ public class ModelRegistry
 
     public bool Write(string model, int id, Dictionary<string, object> values)
     {
+        EnsureModelExists(model);
         var modelFields = GetFields(model);
         var recordValues = new Dictionary<string, object>(values);
 
@@ -639,6 +745,9 @@ public class ModelRegistry
             }
         }
 
+        recordValues.Remove("create_date"); // set once at creation, never client-settable
+        if (modelFields.ContainsKey("write_date")) recordValues["write_date"] = DateTime.UtcNow;
+
         ValidateFieldValues(modelFields, recordValues, requireAll: false);
 
         if (_registeredModelExtensions.TryGetValue(model, out var extensions))
@@ -653,7 +762,7 @@ public class ModelRegistry
         using var conn = _db.CreateConnection();
         conn.Open();
         var tbl = _db.Sanitize(model);
-        var cols = recordValues.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type != FieldType.One2many).ToList();
+        var cols = recordValues.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type is not (FieldType.One2many or FieldType.Many2many)).ToList();
         var setClause = string.Join(", ", cols.Select(c => $"{_db.Quote(c)} = @{c}"));
 
         var sql = $"UPDATE {_db.Quote(tbl)} SET {setClause} WHERE id = @id";
@@ -664,18 +773,62 @@ public class ModelRegistry
         if (conn.Execute(sql, parameters) == 0)
             throw new MissingError($"Record #{id} on model '{model}' no longer exists.");
 
+        foreach (var (fname, fdef) in modelFields)
+        {
+            if (fdef.Type == FieldType.Many2many && recordValues.TryGetValue(fname, out var m2mVal))
+                SyncMany2many(model, fname, fdef, id, m2mVal);
+        }
+
         _logger.LogInformation("Record #{Id} updated on model {Model}", id, model);
         return true;
     }
 
+    // Mirrors Odoo's copy()/duplicate: a shallow clone (child One2many lines are not copied,
+    // matching a "new draft from this one" duplicate rather than a deep recursive clone).
+    public int Copy(string model, int id)
+    {
+        EnsureModelExists(model);
+        var source = SearchRead(model, null, [["id", "=", id]]).FirstOrDefault()
+            ?? throw new MissingError($"Record #{id} on model '{model}' no longer exists.");
+
+        var modelFields = GetFields(model);
+        var copyValues = new Dictionary<string, object>();
+        foreach (var (fname, fdef) in modelFields)
+        {
+            if (fname is "id" or "create_date" or "write_date" || fdef.Type == FieldType.One2many) continue;
+            if (!source.TryGetValue(fname, out var v) || v == null) continue;
+            copyValues[fname] = fdef.Type == FieldType.Many2one && v is object[] arr ? arr[0] : v;
+        }
+        return Create(model, copyValues);
+    }
+
     public bool Unlink(string model, int id)
     {
+        EnsureModelExists(model);
         if (_registeredModelExtensions.TryGetValue(model, out var extensions))
         {
             var records = SearchRead(model, null, [["id", "=", id]]);
             if (records.Count > 0)
             {
                 foreach (var ext in extensions) ext.ValidateOndelete(records[0], this, _logger);
+            }
+        }
+
+        // Clean up join-table rows: both this model's own many2many fields, and any OTHER
+        // model's many2many field that references this record (e.g. deleting a res.groups row
+        // must also drop it from every user's group_ids, or it'd dangle as an orphaned id).
+        foreach (var (ownerModel, ownerFields) in _activeSchema)
+        {
+            foreach (var (fname, fdef) in ownerFields)
+            {
+                if (fdef.Type != FieldType.Many2many) continue;
+                if (ownerModel != model && fdef.Relation != model) continue;
+
+                var (joinTbl, colA, colB) = _db.ManyToManyTable(ownerModel, fname, fdef.Relation!);
+                using var jconn = _db.CreateConnection();
+                jconn.Open();
+                if (ownerModel == model) jconn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id });
+                if (fdef.Relation == model) jconn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colB)} = @id", new { id });
             }
         }
 

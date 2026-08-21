@@ -3,9 +3,6 @@ using System.Security.Cryptography;
 
 namespace Core.OdooEngine;
 
-// ponytail: group membership stored as a CSV string field instead of a real many2many
-// relation/table. Fine while a user only ever needs 1-2 groups (admin vs employee).
-// Add a proper FieldType.Many2many if per-record multi-select group widgets are needed.
 public class BaseUserModel : OdooModel
 {
     public override string Name => "res.users";
@@ -15,7 +12,7 @@ public class BaseUserModel : OdooModel
         AddField("login", FieldType.Char, "Login", required: true, module: "base");
         AddField("password_hash", FieldType.Char, "Password Hash", module: "base");
         AddField("active", FieldType.Boolean, "Active", defaultValue: true, module: "base");
-        AddField("group_ids", FieldType.Char, "Groups", defaultValue: "base.group_user", module: "base");
+        AddField("group_ids", FieldType.Many2many, "Groups", relation: "res.groups", module: "base");
     }
 }
 
@@ -54,8 +51,11 @@ public static class PasswordHasher
 
 public static class SecurityGroups
 {
-    public const string Admin = "base.group_system";
-    public const string Employee = "base.group_user";
+    // Group membership is now a real many2many (res.users.group_ids -> res.groups), so there's
+    // no stable "technical name" like Odoo's XML ids (base.group_system) - match by the group's
+    // actual `name` instead. UniversalRpcController.Login resolves group_ids to names at login.
+    public const string Admin = "Administrator";
+    public const string Employee = "Employee";
 
     public static bool IsAdmin(ClaimsPrincipal user) =>
         (user.FindFirst("groups")?.Value ?? "").Split(',').Contains(Admin);
@@ -65,10 +65,18 @@ public static class SecuritySeed
 {
     public static void EnsureSeedData(ModelRegistry registry)
     {
-        if (registry.SearchRead("res.groups", ["id"]).Count == 0)
+        var existingGroups = registry.SearchRead("res.groups", ["id", "name"]);
+        var adminGroup = existingGroups.FirstOrDefault(g => g["name"]?.ToString() == SecurityGroups.Admin);
+        int adminGroupId;
+
+        if (adminGroup != null)
         {
-            registry.Create("res.groups", new Dictionary<string, object> { ["name"] = "Administrator" });
-            registry.Create("res.groups", new Dictionary<string, object> { ["name"] = "Employee" });
+            adminGroupId = Convert.ToInt32(adminGroup["id"]);
+        }
+        else
+        {
+            adminGroupId = registry.Create("res.groups", new Dictionary<string, object> { ["name"] = SecurityGroups.Admin });
+            registry.Create("res.groups", new Dictionary<string, object> { ["name"] = SecurityGroups.Employee });
         }
 
         if (registry.SearchRead("res.users", ["id"]).Count == 0)
@@ -78,7 +86,7 @@ public static class SecuritySeed
                 ["name"] = "Administrator",
                 ["login"] = "admin",
                 ["password_hash"] = PasswordHasher.Hash("admin"),
-                ["group_ids"] = SecurityGroups.Admin
+                ["group_ids"] = new object[] { adminGroupId }
             });
         }
     }

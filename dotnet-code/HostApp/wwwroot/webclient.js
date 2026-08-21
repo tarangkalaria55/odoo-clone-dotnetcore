@@ -312,7 +312,7 @@ function One2manyGrid({ fieldDef, lines = [], onLinesChange }) {
     );
 }
 
-function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
+function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational, onDuplicated }) {
     const [archDoc, setArchDoc] = useState(null);
     const [fields, setFields] = useState({});
     const [record, setRecord] = useState({});
@@ -327,7 +327,7 @@ function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
         setFields(viewData.fields);
 
         for (const [fname, fdef] of Object.entries(viewData.fields)) {
-            if (fdef.type === 5 && fdef.relation) {
+            if ((fdef.type === 5 || fdef.type === 9) && fdef.relation) {
                 const options = await callKw(fdef.relation, 'name_search', []);
                 setRelOptions(prev => ({ ...prev, [fname]: options }));
             }
@@ -398,6 +398,14 @@ function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
                 const template = btnNode.getAttribute('template');
                 window.open(`/web/report/${encodeURIComponent(model)}/${encodeURIComponent(template)}/${recordId}`, '_blank');
             }
+        } catch (e) { setErrorMsg(e.message); }
+    };
+
+    const handleDuplicate = async () => {
+        setErrorMsg(null);
+        try {
+            const newId = await callKw(model, 'copy', [recordId]);
+            onDuplicated(newId);
         } catch (e) { setErrorMsg(e.message); }
     };
 
@@ -505,6 +513,26 @@ function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
                     );
                 }
 
+                if (fieldDef.type === 9) {
+                    const currentIds = (record[fieldName] || []).map(t => String(Array.isArray(t) ? t[0] : t));
+                    const options = relOptions[fieldName] || [];
+                    return React.createElement('div', { key: fieldName, className: 'col-md-6' },
+                        React.createElement('label', { className: 'form-label fw-semibold text-secondary small' }, fieldDef.string),
+                        React.createElement('select', {
+                            multiple: true,
+                            className: 'form-select form-select-sm',
+                            value: currentIds,
+                            disabled: isReadonly,
+                            size: Math.min(6, Math.max(3, options.length)),
+                            onChange: (e) => handleFieldChange(fieldName, Array.from(e.target.selectedOptions).map(o => parseInt(o.value)))
+                        },
+                            options.map(([optId, optName]) =>
+                                React.createElement('option', { key: optId, value: optId }, optName)
+                            )
+                        )
+                    );
+                }
+
                 if (fieldDef.type === 4 && fieldDef.selection) {
                     return React.createElement('div', { key: fieldName, className: 'col-md-6' },
                         React.createElement('label', { className: 'form-label fw-semibold text-secondary small' }, fieldDef.string),
@@ -544,7 +572,10 @@ function DynamicOdooForm({ model, recordId, onBack, onNavigateRelational }) {
                 ),
                 React.createElement('button', { className: 'btn btn-sm btn-outline-secondary', onClick: onBack },
                     React.createElement('i', { className: 'bi bi-x-lg me-1' }), 'Discard'
-                )
+                ),
+                !isNew ? React.createElement('button', { className: 'btn btn-sm btn-outline-secondary', onClick: handleDuplicate },
+                    React.createElement('i', { className: 'bi bi-copy me-1' }), 'Duplicate'
+                ) : null
             ),
             React.createElement('span', { className: 'badge text-bg-light border text-secondary' }, isNew ? 'New' : `ID: #${recordId}`)
         ),
@@ -822,7 +853,8 @@ function WebClient({ user, onLogout }) {
                         model: activeMenu.targetModel,
                         recordId: selectedRecordId,
                         onBack: () => navigate(activeMenu.id, 'tree'),
-                        onNavigateRelational: handleNavigateRelational
+                        onNavigateRelational: handleNavigateRelational,
+                        onDuplicated: (newId) => navigate(activeMenu.id, 'form', newId)
                     })
                     : viewMode === 'kanban'
                         ? React.createElement(DynamicOdooKanban, {

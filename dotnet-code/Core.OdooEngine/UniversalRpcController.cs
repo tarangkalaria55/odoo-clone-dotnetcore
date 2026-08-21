@@ -60,18 +60,21 @@ public class UniversalRpcController(
             return Unauthorized(new { error = "Invalid login or password" });
         }
 
-        var groupIds = user.TryGetValue("group_ids", out var g) ? g?.ToString() ?? "" : "";
+        // group_ids is a many2many: SearchRead returns [[id,name], ...] tuples for it.
+        var groupNames = user.TryGetValue("group_ids", out var g) && g is List<object[]> groups
+            ? string.Join(",", groups.Select(t => t[1]?.ToString()))
+            : "";
         var claims = new List<Claim>
         {
             new(ClaimTypes.NameIdentifier, user["id"].ToString()!),
             new(ClaimTypes.Name, user["login"]?.ToString() ?? req.Login),
             new("full_name", user["name"]?.ToString() ?? req.Login),
-            new("groups", groupIds)
+            new("groups", groupNames)
         };
         var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
         await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
 
-        var isAdmin = groupIds.Split(',').Contains(SecurityGroups.Admin);
+        var isAdmin = groupNames.Split(',').Contains(SecurityGroups.Admin);
         return Ok(new { uid = user["id"], login = user["login"], name = user["name"], is_admin = isAdmin });
     }
 
@@ -183,6 +186,9 @@ public class UniversalRpcController(
 
                 case "unlink":
                     return Ok(models.Unlink(req.Model, req.Args[0].GetInt32()));
+
+                case "copy":
+                    return Ok(models.Copy(req.Model, req.Args[0].GetInt32()));
 
                 case "name_search":
                     var allRelational = models.SearchRead(req.Model, ["id", "name"]);
