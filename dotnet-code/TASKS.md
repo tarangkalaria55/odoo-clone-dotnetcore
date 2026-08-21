@@ -210,13 +210,39 @@ in code too).
        matching, e.g. `[('invoice_line_ids','any',[('price_unit','>',100)])]`.
        Depends on #2 (domain tree) landing first. Lower priority than the
        above; genuinely needs a related-model subquery-style evaluation.
-8. [ ] **Transactional CRUD** (found while implementing batch create,
-       not in the original survey) — `ModelRegistry` has no ambient
-       transaction anywhere; every `Create`/`Write`/`Unlink` commits on
-       its own connection. Confirmed live: a failing batch `create` leaves
-       earlier rows in the batch committed. Real fix wraps a whole RPC
-       call in one shared transaction/connection — sizable, touches every
-       CRUD method, not scoped further here.
+
+## Done (continued)
+
+- [x] **Transactional CRUD** — `Create`/`Write`/`Unlink`/`SyncMany2many`
+      now take an optional `IDbTransaction? tx = null` parameter (default
+      preserves every existing call site unchanged) and share one
+      connection/transaction when a caller passes one in. New
+      `ModelRegistry.RunInTransaction<T>(Func<IDbTransaction,T>)` opens a
+      connection+transaction, runs the work, commits on success, rolls
+      back and rethrows on any failure. `CreateMulti` is now the first
+      (and so far only) consumer — a batch create is genuinely atomic.
+
+      **Design constraint that shaped this**: `ModelRegistry` is a DI
+      *singleton*, shared across every concurrent request. A transaction
+      can never be stored as mutable instance state on it — that would let
+      one request's rollback reach into another request's in-flight
+      writes. It has to be threaded explicitly through each call, which is
+      why the API is an optional parameter rather than an ambient/ThreadLocal
+      context.
+
+      Verified live against Postgres, reproducing the exact scenario that
+      exposed the gap: a 2-row batch create where row 2 fails validation
+      now leaves **zero** rows committed (previously left row 1
+      committed and orphaned). Confirmed a fully-valid batch still commits
+      all rows, and single `create`/`write`/`unlink` (the `tx=null`
+      default path) are unaffected.
+
+      **Not done**: `Write`/`Unlink` have the same `tx` parameter and
+      would compose correctly with `RunInTransaction`, but there's no
+      batch-write/batch-unlink RPC entry point yet to actually exercise
+      it — the plumbing is there for the next thing that needs it (e.g. a
+      "create order + create lines atomically" flow), not proven live
+      beyond `CreateMulti` itself.
 
 ## Explicitly out of scope
 

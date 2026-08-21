@@ -596,6 +596,37 @@ public class ModelRegistry
         }).ToList();
     }
 
+    // ModelRegistry is a DI singleton (shared across every concurrent request), so a
+    // transaction can never be stored as instance state - that would let one request's rollback
+    // affect another's in-flight writes. It's passed explicitly through each call instead.
+    // Opens one connection+transaction, runs `work`, commits on success, rolls back and
+    // rethrows on any exception (including one raised deep inside Create/Write's own validation).
+    public T RunInTransaction<T>(Func<IDbTransaction, T> work)
+    {
+        using var conn = _db.CreateConnection();
+        conn.Open();
+        using var tx = conn.BeginTransaction();
+        try
+        {
+            var result = work(tx);
+            tx.Commit();
+            return result;
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
+    private static (IDbConnection Conn, bool Owned) GetConnection(DatabaseAdapter db, IDbTransaction? tx)
+    {
+        if (tx?.Connection is { } existing) return (existing, false);
+        var conn = db.CreateConnection();
+        conn.Open();
+        return (conn, true);
+    }
+
     private List<object[]> GetMany2manyValues(string model, string fieldName, FieldDef fdef, int recordId)
     {
         var (joinTbl, colA, colB) = _db.ManyToManyTable(model, fieldName, fdef.Relation!);
@@ -623,16 +654,19 @@ public class ModelRegistry
         _ => new List<int>()
     };
 
-    private void SyncMany2many(string model, string fieldName, FieldDef fdef, int recordId, object? rawValue)
+    private void SyncMany2many(string model, string fieldName, FieldDef fdef, int recordId, object? rawValue, IDbTransaction? tx = null)
     {
         var ids = ExtractMany2manyIds(rawValue);
         var (joinTbl, colA, colB) = _db.ManyToManyTable(model, fieldName, fdef.Relation!);
 
-        using var conn = _db.CreateConnection();
-        conn.Open();
-        conn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id = recordId });
-        foreach (var relId in ids)
-            conn.Execute($"INSERT INTO {_db.Quote(joinTbl)} ({_db.Quote(colA)}, {_db.Quote(colB)}) VALUES (@a, @b)", new { a = recordId, b = relId });
+        var (conn, owned) = GetConnection(_db, tx);
+        try
+        {
+            conn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id = recordId }, tx);
+            foreach (var relId in ids)
+                conn.Execute($"INSERT INTO {_db.Quote(joinTbl)} ({_db.Quote(colA)}, {_db.Quote(colB)}) VALUES (@a, @b)", new { a = recordId, b = relId }, tx);
+        }
+        finally { if (owned) conn.Dispose(); }
     }
 
     // Mirrors what real Odoo surfaces as a friendly ValidationError instead of a raw
@@ -656,7 +690,7 @@ public class ModelRegistry
         }
     }
 
-    public int Create(string model, Dictionary<string, object> values)
+    public int Create(string model, Dictionary<string, object> values, IDbTransaction? tx = null)
     {
         EnsureModelExists(model);
         var modelFields = GetFields(model);
@@ -698,9 +732,9 @@ public class ModelRegistry
 
         int newId;
 
-        using (var conn = _db.CreateConnection())
+        var (conn, owned) = GetConnection(_db, tx);
+        try
         {
-            conn.Open();
             var tbl = _db.Sanitize(model);
             var cols = record.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type is not (FieldType.One2many or FieldType.Many2many)).ToList();
             var colNames = string.Join(", ", cols.Select(c => _db.Quote(c)));
@@ -710,13 +744,14 @@ public class ModelRegistry
 
             var parameters = new DynamicParameters();
             foreach (var col in cols) parameters.Add(col, record[col]);
-            newId = conn.ExecuteScalar<int>(sql, parameters);
+            newId = conn.ExecuteScalar<int>(sql, parameters, tx);
         }
+        finally { if (owned) conn.Dispose(); }
 
         foreach (var (fname, fdef) in modelFields)
         {
             if (fdef.Type == FieldType.Many2many && record.TryGetValue(fname, out var m2mVal))
-                SyncMany2many(model, fname, fdef, newId, m2mVal);
+                SyncMany2many(model, fname, fdef, newId, m2mVal, tx);
         }
 
         LogMessage(model, newId, "System", "Record created", "notification");
@@ -727,11 +762,13 @@ public class ModelRegistry
     // Mirrors @api.model_create_multi (odoo/orm/decorators.py): create() accepts either a
     // single dict or a list of dicts. Each row still goes through the same validation/compute/
     // constrain pipeline as a lone Create() - this is just the batch entry point, not a bulk-
-    // insert fast path (no need for one here at this project's scale).
+    // insert fast path (no need for one here at this project's scale). Wrapped in one
+    // transaction so a failure partway through the batch rolls back everything already
+    // inserted, instead of leaving earlier rows committed.
     public List<int> CreateMulti(string model, List<Dictionary<string, object>> valuesList) =>
-        valuesList.Select(v => Create(model, v)).ToList();
+        RunInTransaction(tx => valuesList.Select(v => Create(model, v, tx)).ToList());
 
-    public bool Write(string model, int id, Dictionary<string, object> values)
+    public bool Write(string model, int id, Dictionary<string, object> values, IDbTransaction? tx = null)
     {
         EnsureModelExists(model);
         var modelFields = GetFields(model);
@@ -766,24 +803,30 @@ public class ModelRegistry
             }
         }
 
-        using var conn = _db.CreateConnection();
-        conn.Open();
-        var tbl = _db.Sanitize(model);
-        var cols = recordValues.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type is not (FieldType.One2many or FieldType.Many2many)).ToList();
-        var setClause = string.Join(", ", cols.Select(c => $"{_db.Quote(c)} = @{c}"));
+        var (conn, owned) = GetConnection(_db, tx);
+        int affected;
+        try
+        {
+            var tbl = _db.Sanitize(model);
+            var cols = recordValues.Keys.Where(k => k != "id" && modelFields.ContainsKey(k) && modelFields[k].Type is not (FieldType.One2many or FieldType.Many2many)).ToList();
+            var setClause = string.Join(", ", cols.Select(c => $"{_db.Quote(c)} = @{c}"));
 
-        var sql = $"UPDATE {_db.Quote(tbl)} SET {setClause} WHERE id = @id";
-        var parameters = new DynamicParameters();
-        parameters.Add("id", id);
-        foreach (var col in cols) parameters.Add(col, recordValues[col]);
+            var sql = $"UPDATE {_db.Quote(tbl)} SET {setClause} WHERE id = @id";
+            var parameters = new DynamicParameters();
+            parameters.Add("id", id);
+            foreach (var col in cols) parameters.Add(col, recordValues[col]);
 
-        if (conn.Execute(sql, parameters) == 0)
+            affected = conn.Execute(sql, parameters, tx);
+        }
+        finally { if (owned) conn.Dispose(); }
+
+        if (affected == 0)
             throw new MissingError($"Record #{id} on model '{model}' no longer exists.");
 
         foreach (var (fname, fdef) in modelFields)
         {
             if (fdef.Type == FieldType.Many2many && recordValues.TryGetValue(fname, out var m2mVal))
-                SyncMany2many(model, fname, fdef, id, m2mVal);
+                SyncMany2many(model, fname, fdef, id, m2mVal, tx);
         }
 
         _logger.LogInformation("Record #{Id} updated on model {Model}", id, model);
@@ -809,7 +852,7 @@ public class ModelRegistry
         return Create(model, copyValues);
     }
 
-    public bool Unlink(string model, int id)
+    public bool Unlink(string model, int id, IDbTransaction? tx = null)
     {
         EnsureModelExists(model);
         if (_registeredModelExtensions.TryGetValue(model, out var extensions))
@@ -832,18 +875,27 @@ public class ModelRegistry
                 if (ownerModel != model && fdef.Relation != model) continue;
 
                 var (joinTbl, colA, colB) = _db.ManyToManyTable(ownerModel, fname, fdef.Relation!);
-                using var jconn = _db.CreateConnection();
-                jconn.Open();
-                if (ownerModel == model) jconn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id });
-                if (fdef.Relation == model) jconn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colB)} = @id", new { id });
+                var (jconn, jowned) = GetConnection(_db, tx);
+                try
+                {
+                    if (ownerModel == model) jconn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id }, tx);
+                    if (fdef.Relation == model) jconn.Execute($"DELETE FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colB)} = @id", new { id }, tx);
+                }
+                finally { if (jowned) jconn.Dispose(); }
             }
         }
 
         _logger.LogWarning("Record #{Id} deleted from model {Model}", id, model);
-        using var conn = _db.CreateConnection();
-        conn.Open();
-        var tbl = _db.Sanitize(model);
-        if (conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id }) == 0)
+        var (conn, owned) = GetConnection(_db, tx);
+        int affected;
+        try
+        {
+            var tbl = _db.Sanitize(model);
+            affected = conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id }, tx);
+        }
+        finally { if (owned) conn.Dispose(); }
+
+        if (affected == 0)
             throw new MissingError($"Record #{id} on model '{model}' no longer exists.");
         return true;
     }
