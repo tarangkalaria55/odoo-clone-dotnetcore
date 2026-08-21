@@ -1,4 +1,5 @@
 using Core.OdooEngine;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.Extensions.FileProviders;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -14,11 +15,22 @@ builder.Logging.SetMinimumLevel(LogLevel.Information);
 
 var mvcBuilder = builder.Services.AddControllers();
 
-var jsConfigPath = Path.Combine(AppContext.BaseDirectory, "appsettings.js");
-if (!File.Exists(jsConfigPath)) jsConfigPath = Path.Combine(Directory.GetCurrentDirectory(), "appsettings.js");
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(options =>
+    {
+        options.Cookie.Name = "odoo_session";
+        options.ExpireTimeSpan = TimeSpan.FromDays(7);
+        options.SlidingExpiration = true;
+        options.Events.OnRedirectToLogin = ctx => { ctx.Response.StatusCode = 401; return Task.CompletedTask; };
+        options.Events.OnRedirectToAccessDenied = ctx => { ctx.Response.StatusCode = 403; return Task.CompletedTask; };
+    });
+builder.Services.AddAuthorization();
+
+var jsConfigPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+if (!File.Exists(jsConfigPath)) jsConfigPath = Path.Combine(Directory.GetCurrentDirectory(), "appsettings.json");
 
 var tempLogger = LoggerFactory.Create(b => b.AddSimpleConsole()).CreateLogger("Bootstrap");
-var jsConfig = AppSettingsConfig.LoadFromJsFile(jsConfigPath, tempLogger);
+var jsConfig = AppSettingsConfig.LoadFromJsonFile(jsConfigPath, tempLogger);
 var resolvedAddonsPaths = jsConfig.ResolveAddonsAbsolutePaths(AppContext.BaseDirectory);
 
 builder.Services.AddSingleton(jsConfig);
@@ -52,6 +64,8 @@ if (modelRegistry.SearchRead("res.partner", ["id"]).Count == 0)
     });
 }
 
+SecuritySeed.EnsureSeedData(modelRegistry);
+
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
@@ -76,5 +90,7 @@ foreach (var root in resolvedAddonsPaths)
 }
 
 app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
 app.MapControllers();
 app.Run();

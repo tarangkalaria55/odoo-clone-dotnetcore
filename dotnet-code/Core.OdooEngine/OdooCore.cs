@@ -2,7 +2,6 @@ using System.Data;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using System.Xml.XPath;
 using Dapper;
@@ -46,32 +45,20 @@ public class AppSettingsConfig
     public string ConnectionString { get; set; } = "";
     public int Port { get; set; } = 5000;
 
-    public static AppSettingsConfig LoadFromJsFile(string jsFilePath, ILogger? logger = null)
+    public static AppSettingsConfig LoadFromJsonFile(string jsonFilePath, ILogger? logger = null)
     {
         var config = new AppSettingsConfig();
-        if (!File.Exists(jsFilePath)) return config;
+        if (!File.Exists(jsonFilePath)) return config;
 
         try
         {
-            var rawContent = File.ReadAllText(jsFilePath);
-            var cleanJs = Regex.Replace(rawContent, @"/\*.*?\*/", "", RegexOptions.Singleline);
-            cleanJs = Regex.Replace(cleanJs, @"//.*", "");
-
-            var match = Regex.Match(cleanJs, @"(?:module\.exports\s*=|export\s+default)\s*(\{[\s\S]*\})");
-            if (match.Success)
-            {
-                var jsonLike = match.Groups[1].Value.Trim().TrimEnd(';');
-                var validJson = Regex.Replace(jsonLike, @"(\w+)\s*:", "\"$1\":");
-                validJson = Regex.Replace(validJson, @"'([^']*)'", "\"$1\"");
-
-                var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-                var parsed = JsonSerializer.Deserialize<AppSettingsConfig>(validJson, options);
-                if (parsed != null) return parsed;
-            }
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var parsed = JsonSerializer.Deserialize<AppSettingsConfig>(File.ReadAllText(jsonFilePath), options);
+            if (parsed != null) return parsed;
         }
         catch (Exception ex)
         {
-            logger?.LogError(ex, "Failed to parse appsettings.js.");
+            logger?.LogError(ex, "Failed to parse appsettings.json.");
         }
         return config;
     }
@@ -991,6 +978,8 @@ public class OdooModuleLifecycleManager
         _menuRegistry.Clear();
 
         _modelRegistry.Register(new BasePartnerModel());
+        _modelRegistry.Register(new BaseUserModel());
+        _modelRegistry.Register(new BaseGroupModel());
 
         _viewRegistry.AddBaseView(new BaseView(
             Id: "base.view_partner_form",
@@ -1069,6 +1058,13 @@ public class OdooModuleLifecycleManager
                 }
                 _mvcBuilder.AddApplicationPart(asm);
             }
+        }
+
+        _modelRegistry.AutoSyncSchema();
+
+        foreach (var (techName, manifest) in _discoveredManifests)
+        {
+            if (manifest.State != "installed") continue;
 
             foreach (var relativeData in manifest.Data)
             {
@@ -1081,6 +1077,5 @@ public class OdooModuleLifecycleManager
         }
 
         _menuRegistry.AddMenu(new OdooMenuItem("apps_manager", "Apps", "bi-box-seam-fill", "client_action", null, null, "/webclient.js", "AppsManagerDashboard", Module: "base"));
-        _modelRegistry.AutoSyncSchema();
     }
 }

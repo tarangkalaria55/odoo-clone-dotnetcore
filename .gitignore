@@ -494,3 +494,4 @@ $RECYCLE.BIN/
 opencode.json
 
 odoo-19.0
+*.db*

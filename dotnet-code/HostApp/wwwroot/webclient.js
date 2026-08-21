@@ -162,23 +162,38 @@ function One2manyGrid({ fieldDef, lines = [], onLinesChange }) {
         onLinesChange([...lines, newLine]);
     };
 
-    const updateCell = async (index, fieldName, value) => {
+    const updateCells = async (index, patch) => {
         const updated = [...lines];
-        updated[index] = { ...updated[index], [fieldName]: value };
+        updated[index] = { ...updated[index], ...patch };
 
         try {
-            const res = await callKw(childModel, 'onchange', [fieldName, updated[index]]);
+            const res = await callKw(childModel, 'onchange', [Object.keys(patch)[0], updated[index]]);
             if (res && res.value) {
                 updated[index] = { ...updated[index], ...res.value };
             }
         } catch (err) { }
 
-        if (fieldName === 'quantity' || fieldName === 'price_unit' || fieldName === 'product_uom_qty') {
+        if ('quantity' in patch || 'price_unit' in patch || 'product_uom_qty' in patch) {
             const qty = parseFloat(updated[index].quantity || updated[index].product_uom_qty) || 0;
             const price = parseFloat(updated[index].price_unit) || 0;
             updated[index].price_subtotal = qty * price;
         }
         onLinesChange(updated);
+    };
+
+    const updateCell = (index, fieldName, value) => updateCells(index, { [fieldName]: value });
+
+    const quickCreateRelated = async (idx, col, relation, label) => {
+        const name = window.prompt(`New ${label}:`);
+        if (!name) return;
+        const payload = { name };
+        const isProduct = relation === 'product.template';
+        const price = isProduct ? parseFloat(window.prompt('Price:', '0')) || 0 : null;
+        if (isProduct) { payload.list_price = price; payload.standard_price = price; }
+
+        const newId = await callKw(relation, 'create', [payload]);
+        setRelOptions(prev => ({ ...prev, [col]: [...(prev[col] || []), [newId, name]] }));
+        await updateCells(idx, isProduct && childFields['price_unit'] ? { [col]: newId, price_unit: price } : { [col]: newId });
     };
 
     const removeLine = (index) => {
@@ -207,12 +222,19 @@ function One2manyGrid({ fieldDef, lines = [], onLinesChange }) {
                                     React.createElement('select', {
                                         className: 'form-select form-select-sm border-0 bg-transparent',
                                         value: currentVal || '',
-                                        onChange: (e) => updateCell(idx, col, parseInt(e.target.value) || 0)
+                                        onChange: (e) => {
+                                            if (e.target.value === '__new__') {
+                                                quickCreateRelated(idx, col, fdef.relation, fdef.string || col);
+                                                return;
+                                            }
+                                            updateCell(idx, col, parseInt(e.target.value) || 0);
+                                        }
                                     },
                                         React.createElement('option', { value: '' }, '-- Select --'),
                                         (relOptions[col] || []).map(([optId, optName]) =>
                                             React.createElement('option', { key: optId, value: optId }, optName)
-                                        )
+                                        ),
+                                        React.createElement('option', { value: '__new__' }, `+ Add new ${fdef.string || col}...`)
                                     )
                                 );
                             }
@@ -576,30 +598,136 @@ function DynamicOdooList({ model, onOpenRecord, domain }) {
     );
 }
 
-function WebClient() {
+function LoginScreen({ onLogin }) {
+    const [login, setLogin] = useState('admin');
+    const [password, setPassword] = useState('');
+    const [error, setError] = useState(null);
+    const [busy, setBusy] = useState(false);
+
+    const submit = async (e) => {
+        e.preventDefault();
+        setBusy(true);
+        setError(null);
+        try {
+            const res = await fetch('/web/session/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ login, password })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Login failed');
+            onLogin(data);
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    return React.createElement('div', { className: 'd-flex align-items-center justify-content-center', style: { height: '100vh' } },
+        React.createElement('form', { onSubmit: submit, className: 'card p-4 shadow-sm', style: { width: 340 } },
+            React.createElement('h4', { className: 'mb-3 text-center' }, 'Odoo Enterprise ERP'),
+            error ? React.createElement('div', { className: 'alert alert-danger py-2' }, error) : null,
+            React.createElement('div', { className: 'mb-2' },
+                React.createElement('label', { className: 'form-label' }, 'Login'),
+                React.createElement('input', { className: 'form-control', value: login, onChange: e => setLogin(e.target.value), autoFocus: true })
+            ),
+            React.createElement('div', { className: 'mb-3' },
+                React.createElement('label', { className: 'form-label' }, 'Password'),
+                React.createElement('input', { type: 'password', className: 'form-control', value: password, onChange: e => setPassword(e.target.value) })
+            ),
+            React.createElement('button', { type: 'submit', className: 'btn o-btn-primary w-100', disabled: busy }, busy ? 'Signing in...' : 'Log in')
+        )
+    );
+}
+
+function AppRoot() {
+    const [user, setUser] = useState(undefined);
+
+    useEffect(() => {
+        fetch('/web/session/whoami').then(res => res.ok ? res.json() : null).then(setUser);
+    }, []);
+
+    const logout = async () => {
+        await fetch('/web/session/logout', { method: 'POST' });
+        setUser(null);
+    };
+
+    if (user === undefined) return React.createElement('div', { className: 'p-5 text-center' }, 'Loading Suite...');
+    if (!user) return React.createElement(LoginScreen, { onLogin: setUser });
+    return React.createElement(WebClient, { user, onLogout: logout });
+}
+
+function WebClient({ user, onLogout }) {
     const [menus, setMenus] = useState([]);
     const [activeMenu, setActiveMenu] = useState(null);
     const [viewMode, setViewMode] = useState('tree');
     const [selectedRecordId, setSelectedRecordId] = useState(null);
     const [domain, setDomain] = useState([]);
 
+    const VIEW_TYPE_TO_URL = { tree: 'list', kanban: 'kanban', form: 'form' };
+    const VIEW_TYPE_FROM_URL = { list: 'tree', kanban: 'kanban', form: 'form' };
+
+    const parseHash = () => {
+        const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+        const menuId = parseInt(params.get('menu_id'));
+        if (!menuId) return null;
+        const id = params.get('id');
+        return {
+            menuId,
+            viewMode: VIEW_TYPE_FROM_URL[params.get('view_type')] || 'tree',
+            recordId: id ? parseInt(id) : null
+        };
+    };
+
+    const applyHash = (menuList) => {
+        const parsed = parseHash();
+        const menu = parsed && menuList.find(m => m.id === parsed.menuId);
+        if (!menu) return false;
+        setActiveMenu(menu);
+        setViewMode(parsed.viewMode);
+        setSelectedRecordId(parsed.recordId);
+        return true;
+    };
+
+    const navigate = (menuId, mode = 'tree', recordId = null) => {
+        const menu = menus.find(m => m.id === menuId);
+        const params = new URLSearchParams();
+        params.set('menu_id', menuId);
+        if (menu?.targetModel) params.set('model', menu.targetModel);
+        params.set('view_type', VIEW_TYPE_TO_URL[mode] || mode);
+        if (mode === 'form' && recordId) params.set('id', recordId);
+        window.location.hash = params.toString();
+    };
+
     const loadSessionMenus = () => {
         fetch('/web/session/modules').then(res => res.json()).then(data => {
             setMenus(data);
-            if (!activeMenu || !data.some(m => m.id === activeMenu.id)) {
-                if (data.length > 0) setActiveMenu(data[0]);
+            if (!applyHash(data) && data.length > 0) {
+                setActiveMenu(data[0]);
+                navigate(data[0].id, 'tree');
             }
         });
     };
 
     useEffect(() => { loadSessionMenus(); }, []);
 
+    useEffect(() => {
+        const onHashChange = () => applyHash(menus);
+        window.addEventListener('hashchange', onHashChange);
+        return () => window.removeEventListener('hashchange', onHashChange);
+    }, [menus]);
+
+    const selectMenu = (m) => {
+        setDomain([]);
+        navigate(m.id, 'tree');
+    };
+
     const handleNavigateRelational = (targetModel, field, id) => {
         const targetMenu = menus.find(m => m.targetModel === targetModel);
         if (targetMenu) {
-            setActiveMenu(targetMenu);
             setDomain([[field, '=', id]]);
-            setViewMode('tree');
+            navigate(targetMenu.id, 'tree');
         }
     };
 
@@ -615,27 +743,33 @@ function WebClient() {
                 menus.map(m => React.createElement('a', {
                     key: m.id,
                     className: `nav-link px-3 ${activeMenu.id === m.id ? 'active fw-bold' : 'text-white-50'}`,
-                    onClick: () => { setActiveMenu(m); setViewMode('tree'); setSelectedRecordId(null); setDomain([]); }
+                    onClick: () => selectMenu(m)
                 },
                     React.createElement('i', { className: `bi ${m.icon} me-1` }),
                     m.name
                 ))
+            ),
+            React.createElement('div', { className: 'navbar-nav ms-auto' },
+                React.createElement('span', { className: 'nav-link text-white-50' },
+                    React.createElement('i', { className: 'bi bi-person-circle me-1' }), user.name),
+                React.createElement('a', { className: 'nav-link text-white-50', onClick: onLogout, style: { cursor: 'pointer' } },
+                    React.createElement('i', { className: 'bi bi-box-arrow-right me-1' }), 'Logout')
             )
         ),
         activeMenu.actionType !== 'client_action' && viewMode !== 'form' ? (
             React.createElement('div', { className: 'd-flex justify-content-between align-items-center bg-white p-3 border-bottom shadow-sm mb-3' },
-                React.createElement('button', { 
-                    className: 'btn btn-sm o-btn-primary', 
-                    onClick: () => { setSelectedRecordId(null); setViewMode('form'); } 
+                React.createElement('button', {
+                    className: 'btn btn-sm o-btn-primary',
+                    onClick: () => navigate(activeMenu.id, 'form')
                 }, React.createElement('i', { className: 'bi bi-plus-lg me-1' }), 'New'),
                 React.createElement('div', { className: 'btn-group' },
                     React.createElement('button', {
                         className: `btn btn-sm ${viewMode === 'tree' ? 'btn-secondary' : 'btn-outline-secondary'}`,
-                        onClick: () => setViewMode('tree')
+                        onClick: () => navigate(activeMenu.id, 'tree')
                     }, React.createElement('i', { className: 'bi bi-list-ul' })),
                     React.createElement('button', {
                         className: `btn btn-sm ${viewMode === 'kanban' ? 'btn-secondary' : 'btn-outline-secondary'}`,
-                        onClick: () => setViewMode('kanban')
+                        onClick: () => navigate(activeMenu.id, 'kanban')
                     }, React.createElement('i', { className: 'bi bi-kanban' }))
                 )
             )
@@ -647,19 +781,19 @@ function WebClient() {
                     ? React.createElement(DynamicOdooForm, {
                         model: activeMenu.targetModel,
                         recordId: selectedRecordId,
-                        onBack: () => setViewMode('tree'),
+                        onBack: () => navigate(activeMenu.id, 'tree'),
                         onNavigateRelational: handleNavigateRelational
                     })
                     : viewMode === 'kanban'
                         ? React.createElement(DynamicOdooKanban, {
                             model: activeMenu.targetModel,
                             domain: domain,
-                            onOpenRecord: (id) => { setSelectedRecordId(id); setViewMode('form'); }
+                            onOpenRecord: (id) => navigate(activeMenu.id, 'form', id)
                         })
                         : React.createElement(DynamicOdooList, {
                             model: activeMenu.targetModel,
                             domain: domain,
-                            onOpenRecord: (id) => { setSelectedRecordId(id); setViewMode('form'); }
+                            onOpenRecord: (id) => navigate(activeMenu.id, 'form', id)
                         })
         )
     );
@@ -679,4 +813,4 @@ function DynamicModulePage({ scriptUrl, componentName }) {
     return React.createElement(Component, { callKw });
 }
 
-createRoot(document.getElementById('root')).render(React.createElement(WebClient));
+createRoot(document.getElementById('root')).render(React.createElement(AppRoot));
