@@ -208,6 +208,39 @@ in code too).
       `res.users` with an existing `login` gets `"This login is already
       taken."` (400) instead of a raw Postgres constraint error.
 
+- [x] **Many2one `ondelete` policy** (`odoo/orm/fields_relational.py`
+      `Many2one` `ondelete=`) — `FieldDef` gained an `Ondelete` slot;
+      `AddField`'s new `ondelete` parameter defaults to `"restrict"` for a
+      required Many2one and `"set null"` for an optional one (matches real
+      Odoo's own default logic — a required column can't silently go
+      null). `Unlink` now scans every model's Many2one fields for
+      references to the record being deleted and applies the declared
+      policy: `restrict` throws a friendly `UserError` (422) naming the
+      referencing model/field/count; `cascade` recursively `UnlinkCore`s
+      the referencing rows (so nested cascades and their own `ondelete`
+      policies apply too); `set null` nulls the column out directly.
+
+      **Correctness fix that came with this**: the whole delete (restrict
+      check, cascades, many2many join cleanup, the row delete itself) now
+      always runs inside one transaction — the caller's `tx` if supplied,
+      otherwise `Unlink` wraps its own via `RunInTransaction`. Without
+      that, a cascade touching several tables could partially apply before
+      a later restrict-check aborted it.
+
+      Set three real child-line `move_id`/`order_id` Many2one fields
+      (`account.move.line`, `sale.order.line`, `purchase.order.line`) to
+      `ondelete: "cascade"` explicitly, matching what real Odoo actually
+      declares for master-detail lines — deleting an invoice/order now
+      takes its lines with it instead of orphaning them.
+
+      Verified live against Postgres, all three modes: deleting a
+      `res.partner` referenced by 14 invoices was blocked with `"Cannot
+      delete this res.partner record: still referenced by 14 record(s)
+      via account.move.partner_id."` (422); deleting an invoice
+      cascade-deleted its line; deleting a `stock.lot` referenced by a
+      (non-required) purchase order line's `lot_id` succeeded and left the
+      line intact with `lot_id: null`.
+
 ## In progress / next up (priority order, core framework only)
 
 1. [ ] **X2many write-commands** (`odoo/orm/commands.py`, the
@@ -226,14 +259,10 @@ in code too).
        C# collection-expression literal (`[["field","=",val]]`) — needs a
        careful, isolated pass with its own verification, not bundled into
        a larger batch.
-3. [ ] **Many2one `ondelete` policy** (`odoo/orm/fields_relational.py`
-       `Many2one` `ondelete=`) — `Unlink()` has no FK-safety net; deleting
-       a referenced row either orphans child rows or throws a raw Postgres
-       FK-violation exception instead of a friendly error / cascade.
-4. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
+3. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
        `IOdooAddon` has no lifecycle callback beyond `RegisterModels` for
        one-time data seeding/migration on install or cleanup on uninstall.
-5. [ ] **`any`/`not any` domain operator** — relational sub-domain
+4. [ ] **`any`/`not any` domain operator** — relational sub-domain
        matching, e.g. `[('invoice_line_ids','any',[('price_unit','>',100)])]`.
        Depends on #2 (domain tree) landing first. Lower priority than the
        above; genuinely needs a related-model subquery-style evaluation.

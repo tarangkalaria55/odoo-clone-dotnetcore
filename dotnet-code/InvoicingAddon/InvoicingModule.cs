@@ -8,7 +8,7 @@ public class AccountMoveLineModel : OdooModel
 
     public AccountMoveLineModel()
     {
-        AddField("move_id", FieldType.Many2one, "Invoice Reference", relation: "account.move", module: "InvoicingAddon");
+        AddField("move_id", FieldType.Many2one, "Invoice Reference", relation: "account.move", module: "InvoicingAddon", ondelete: "cascade");
         AddField("product_id", FieldType.Many2one, "Product", relation: "product.template", required: true, module: "InvoicingAddon");
         AddField("name", FieldType.Char, "Label / Description", module: "InvoicingAddon");
         AddField("lot_id", FieldType.Many2one, "Lot / Batch Selection", relation: "stock.lot", module: "InvoicingAddon");

@@ -103,6 +103,9 @@ public class OdooManifest
 public enum FieldType { Char, Integer, Float, Boolean, Selection, Many2one, One2many, DateTime, Text, Many2many }
 public record SelectionOption(string Value, string Label);
 
+// Ondelete is only meaningful for Many2one: "restrict" (block deleting the referenced record
+// while any row still points at it), "cascade" (delete those rows too), "set null" (null out
+// the reference). Mirrors odoo/orm/fields_relational.py Many2one's `ondelete` parameter.
 public record FieldDef(
     string Name,
     FieldType Type,
@@ -114,7 +117,8 @@ public record FieldDef(
     bool Readonly = false,
     bool Required = false,
     string? Compute = null,
-    string? Module = "base"
+    string? Module = "base",
+    string? Ondelete = null
 );
 
 public record MailMessage(int Id, string Model, int RecordId, string Author, string Body, string Date, string Type);
@@ -146,9 +150,13 @@ public abstract class OdooModel
         bool readonlyField = false,
         bool required = false,
         string? compute = null,
-        string? module = "base")
+        string? module = "base",
+        string? ondelete = null)
     {
-        Fields[name] = new FieldDef(name, type, label, defaultValue, relation, inverseName, selection, readonlyField, required, compute, module);
+        // Matches Odoo's own default logic: a required many2one can't silently go null on
+        // delete, so it defaults to "restrict" instead of "set null" unless told otherwise.
+        var resolvedOndelete = type == FieldType.Many2one ? ondelete ?? (required ? "restrict" : "set null") : null;
+        Fields[name] = new FieldDef(name, type, label, defaultValue, relation, inverseName, selection, readonlyField, required, compute, module, resolvedOndelete);
     }
 
     public virtual Dictionary<string, object> EvaluateOnchange(string fieldName, Dictionary<string, object> currentValues, ModelRegistry registry, ILogger logger)
@@ -905,15 +913,53 @@ public class ModelRegistry
         return Create(model, copyValues, uid: uid);
     }
 
+    // Cascades (and any restrict-check they trigger) can touch several tables, so unlink always
+    // runs inside a transaction: the caller's if one was passed in, otherwise a fresh one of its
+    // own - either way it's all-or-nothing, never a partially-applied cascade.
     public bool Unlink(string model, int id, IDbTransaction? tx = null)
     {
         EnsureModelExists(model);
+        return tx != null ? UnlinkCore(model, id, tx) : RunInTransaction(newTx => UnlinkCore(model, id, newTx));
+    }
+
+    private bool UnlinkCore(string model, int id, IDbTransaction tx)
+    {
         if (_registeredModelExtensions.TryGetValue(model, out var extensions))
         {
             var records = SearchRead(model, null, [["id", "=", id]]);
             if (records.Count > 0)
             {
                 foreach (var ext in extensions) ext.ValidateOndelete(records[0], this, _logger);
+            }
+        }
+
+        // Many2one ondelete policy (odoo/orm/fields_relational.py): for every OTHER model's
+        // field that points at this record, restrict/cascade/null it out per that field's
+        // declared `ondelete`. Recursing into UnlinkCore for "cascade" reuses this same logic
+        // (and the same transaction) for whatever the cascaded rows themselves reference.
+        foreach (var (refModel, refFields) in _activeSchema)
+        {
+            foreach (var (fname, fdef) in refFields)
+            {
+                if (fdef.Type != FieldType.Many2one || fdef.Relation != model) continue;
+
+                var referencing = SearchRead(refModel, ["id"], [[fname, "=", id]]);
+                if (referencing.Count == 0) continue;
+
+                if (fdef.Ondelete == "restrict")
+                {
+                    throw new UserError($"Cannot delete this {model} record: still referenced by {referencing.Count} record(s) via {refModel}.{fname}.");
+                }
+                if (fdef.Ondelete == "cascade")
+                {
+                    foreach (var r in referencing) UnlinkCore(refModel, Convert.ToInt32(r["id"]), tx);
+                }
+                else // "set null"
+                {
+                    var (nconn, nowned) = GetConnection(_db, tx);
+                    try { nconn.Execute($"UPDATE {_db.Quote(_db.Sanitize(refModel))} SET {_db.Quote(fname)} = NULL WHERE {_db.Quote(fname)} = @id", new { id }, tx); }
+                    finally { if (nowned) nconn.Dispose(); }
+                }
             }
         }
 

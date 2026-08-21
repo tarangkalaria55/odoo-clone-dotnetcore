@@ -8,7 +8,7 @@ public class SaleOrderLineModel : OdooModel
 
     public SaleOrderLineModel()
     {
-        AddField("order_id", FieldType.Many2one, "Order Reference", relation: "sale.order", module: "SalesAddon");
+        AddField("order_id", FieldType.Many2one, "Order Reference", relation: "sale.order", module: "SalesAddon", ondelete: "cascade");
         AddField("product_id", FieldType.Many2one, "Product", relation: "product.template", required: true, module: "SalesAddon");
         AddField("name", FieldType.Char, "Description", module: "SalesAddon");
         AddField("product_uom_qty", FieldType.Float, "Quantity", defaultValue: 1.0, module: "SalesAddon");

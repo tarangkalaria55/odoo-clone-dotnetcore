@@ -8,7 +8,7 @@ public class PurchaseOrderLineModel : OdooModel
 
     public PurchaseOrderLineModel()
     {
-        AddField("order_id", FieldType.Many2one, "Order Reference", relation: "purchase.order", module: "PurchaseAddon");
+        AddField("order_id", FieldType.Many2one, "Order Reference", relation: "purchase.order", module: "PurchaseAddon", ondelete: "cascade");
         AddField("product_id", FieldType.Many2one, "Product Name", relation: "product.template", required: true, module: "PurchaseAddon");
         AddField("lot_id", FieldType.Many2one, "Batch No / Lot", relation: "stock.lot", module: "PurchaseAddon");
         AddField("mrp", FieldType.Float, "MRP ($)", defaultValue: 0.0, module: "PurchaseAddon");
