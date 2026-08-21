@@ -77,6 +77,15 @@ public class AccountMoveModel : OdooModel
         registry.Write("account.move", id, new Dictionary<string, object> { ["status"] = "posted" });
         return new { status = "posted" };
     }
+
+    [ApiOndelete]
+    public void UnlinkExceptPosted(Dictionary<string, object> record)
+    {
+        if (record.TryGetValue("status", out var status) && status?.ToString() != "draft")
+        {
+            throw new ValidationError("Can't delete a posted or paid invoice.");
+        }
+    }
 }
 
 public class InvoicingModule : IOdooAddon

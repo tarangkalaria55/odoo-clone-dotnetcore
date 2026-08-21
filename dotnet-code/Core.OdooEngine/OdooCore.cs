@@ -32,7 +32,17 @@ public class ApiConstrainsAttribute(params string[] fields) : Attribute
     public string[] Fields { get; } = fields;
 }
 
-public class ValidationError(string message) : Exception(message);
+// Mirrors odoo/orm/decorators.py @api.ondelete: runs a business-rule guard before a record
+// is actually deleted (e.g. "can't delete a posted invoice"), separate from field @api.constrains.
+[AttributeUsage(AttributeTargets.Method)]
+public class ApiOndeleteAttribute : Attribute;
+
+// Mirrors odoo/exceptions.py's user-facing exception hierarchy - each maps to a distinct HTTP
+// status in UniversalRpcController rather than everything falling into a generic 400/500.
+public class ValidationError(string message) : Exception(message);      // 400 - a field/record constraint was violated
+public class UserError(string message) : Exception(message);            // 422 - valid data, but not allowed given current state
+public class AccessError(string message) : Exception(message);          // 403 - not permitted to read/write/delete this
+public class MissingError(string message) : Exception(message);         // 404 - record no longer exists
 
 public class AppSettingsConfig
 {
@@ -82,6 +92,7 @@ public class OdooManifest
     public List<string> Data { get; set; } = new();
     public bool Application { get; set; } = false;
     public bool Installable { get; set; } = true;
+    public bool AutoInstall { get; set; } = false;
     public string? AssemblyFile { get; set; }
     public string State { get; set; } = "uninstalled";
     public string FolderPath { get; set; } = string.Empty;
@@ -193,6 +204,20 @@ public abstract class OdooModel
         }
     }
 
+    public virtual void ValidateOndelete(Dictionary<string, object> record, ModelRegistry registry, ILogger logger)
+    {
+        foreach (var method in this.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (method.GetCustomAttribute<ApiOndeleteAttribute>() != null)
+            {
+                var parameters = method.GetParameters();
+                if (parameters.Length == 2) method.Invoke(this, [record, registry]);
+                else if (parameters.Length == 1) method.Invoke(this, [record]);
+                else method.Invoke(this, null);
+            }
+        }
+    }
+
     // Mirrors Odoo's get_public_method (odoo/service/model.py): only model-declared action
     // methods are callable over RPC, not framework hooks or inherited object members.
     private static readonly HashSet<string> RpcBlockedMethods = new(StringComparer.OrdinalIgnoreCase)
@@ -206,6 +231,7 @@ public abstract class OdooModel
         && method.GetCustomAttribute<ApiOnchangeAttribute>() == null
         && method.GetCustomAttribute<ApiDependsAttribute>() == null
         && method.GetCustomAttribute<ApiConstrainsAttribute>() == null
+        && method.GetCustomAttribute<ApiOndeleteAttribute>() == null
         && method.DeclaringType != typeof(OdooModel)
         && method.DeclaringType != typeof(object);
 
@@ -516,6 +542,27 @@ public class ModelRegistry
         }).ToList();
     }
 
+    // Mirrors what real Odoo surfaces as a friendly ValidationError instead of a raw
+    // Postgres NOT NULL / constraint failure (odoo/orm/fields.py `required`, fields_selection.py).
+    private static void ValidateFieldValues(Dictionary<string, FieldDef> modelFields, Dictionary<string, object> record, bool requireAll)
+    {
+        foreach (var (fname, fdef) in modelFields)
+        {
+            var touched = record.TryGetValue(fname, out var v);
+            var isEmpty = !touched || v == null || (v is string s && s.Length == 0);
+
+            if (fdef.Required && isEmpty && (requireAll || touched))
+                throw new ValidationError($"{fdef.String} is required.");
+
+            if (touched && v != null && fdef.Selection is { Count: > 0 } options)
+            {
+                var vStr = v.ToString();
+                if (!options.Any(o => o.Value == vStr))
+                    throw new ValidationError($"'{vStr}' is not a valid value for {fdef.String}.");
+            }
+        }
+    }
+
     public int Create(string model, Dictionary<string, object> values)
     {
         var modelFields = GetFields(model);
@@ -525,7 +572,7 @@ public class ModelRegistry
         {
             if (!record.ContainsKey(fname) && fdef.DefaultValue != null)
                 record[fname] = fdef.DefaultValue;
-            
+
             if (fdef.Type == FieldType.Many2one && record.TryGetValue(fname, out var val) && val != null)
             {
                 if (val is JsonElement je && je.ValueKind == JsonValueKind.Array && je.GetArrayLength() > 0)
@@ -538,6 +585,8 @@ public class ModelRegistry
                 }
             }
         }
+
+        ValidateFieldValues(modelFields, record, requireAll: true);
 
         if (_registeredModelExtensions.TryGetValue(model, out var extensions))
         {
@@ -590,6 +639,8 @@ public class ModelRegistry
             }
         }
 
+        ValidateFieldValues(modelFields, recordValues, requireAll: false);
+
         if (_registeredModelExtensions.TryGetValue(model, out var extensions))
         {
             foreach (var ext in extensions)
@@ -610,18 +661,31 @@ public class ModelRegistry
         parameters.Add("id", id);
         foreach (var col in cols) parameters.Add(col, recordValues[col]);
 
-        var success = conn.Execute(sql, parameters) > 0;
+        if (conn.Execute(sql, parameters) == 0)
+            throw new MissingError($"Record #{id} on model '{model}' no longer exists.");
+
         _logger.LogInformation("Record #{Id} updated on model {Model}", id, model);
-        return success;
+        return true;
     }
 
     public bool Unlink(string model, int id)
     {
+        if (_registeredModelExtensions.TryGetValue(model, out var extensions))
+        {
+            var records = SearchRead(model, null, [["id", "=", id]]);
+            if (records.Count > 0)
+            {
+                foreach (var ext in extensions) ext.ValidateOndelete(records[0], this, _logger);
+            }
+        }
+
         _logger.LogWarning("Record #{Id} deleted from model {Model}", id, model);
         using var conn = _db.CreateConnection();
         conn.Open();
         var tbl = _db.Sanitize(model);
-        return conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id }) > 0;
+        if (conn.Execute($"DELETE FROM {_db.Quote(tbl)} WHERE id = @id", new { id }) == 0)
+            throw new MissingError($"Record #{id} on model '{model}' no longer exists.");
+        return true;
     }
 
     public void LogMessage(string model, int recordId, string author, string body, string type = "comment")
@@ -904,12 +968,16 @@ public class OdooModuleLifecycleManager
 
         if (install)
         {
+            if (!manifest.Installable)
+                return $"Module '{manifest.Name}' is not installable.";
+
             foreach (var dep in CollectTransitiveDeps(technicalName))
             {
-                if (_discoveredManifests.TryGetValue(dep, out var depManifest))
+                if (_discoveredManifests.TryGetValue(dep, out var depManifest) && depManifest.Installable)
                     depManifest.State = "installed";
             }
             manifest.State = "installed";
+            InstallAutoInstallModules();
         }
         else
         {
@@ -945,6 +1013,26 @@ public class OdooModuleLifecycleManager
         }
         Walk(technicalName);
         return seen;
+    }
+
+    // Odoo's "glue module" pattern (odoo/modules/module.py manifest `auto_install`): a module
+    // installs itself automatically the moment every one of its dependencies is installed.
+    private void InstallAutoInstallModules()
+    {
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var m in _discoveredManifests.Values)
+            {
+                if (m.State == "installed" || !m.AutoInstall || !m.Installable) continue;
+                if (m.Depends.All(d => d == "base" || (_discoveredManifests.TryGetValue(d, out var dm) && dm.State == "installed")))
+                {
+                    m.State = "installed";
+                    changed = true;
+                }
+            }
+        } while (changed);
     }
 
     public void RebuildActiveState()

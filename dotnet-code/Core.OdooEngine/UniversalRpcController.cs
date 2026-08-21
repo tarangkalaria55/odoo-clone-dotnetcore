@@ -198,20 +198,29 @@ public class UniversalRpcController(
                     return Ok(models.ExecuteButtonAction(req.Model, req.Method, btnRecordId, currentValues) ?? new { status = "success" });
             }
         }
-        catch (TargetInvocationException tie) when (tie.InnerException is ValidationError ve)
+        catch (Exception raw)
         {
-            logger.LogWarning("Validation error on {Model}: {Message}", req.Model, ve.Message);
-            return BadRequest(new { error = ve.Message });
-        }
-        catch (ValidationError ve)
-        {
-            logger.LogWarning("Validation error on {Model}: {Message}", req.Model, ve.Message);
-            return BadRequest(new { error = ve.Message });
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "RPC execution error on model {Model}, method {Method}", req.Model, req.Method);
-            return StatusCode(500, new { error = ex.Message });
+            // Reflection-invoked model methods (onchange/constrains/ondelete/action handlers)
+            // wrap thrown exceptions in TargetInvocationException - unwrap once here.
+            var ex = raw is TargetInvocationException { InnerException: { } inner } ? inner : raw;
+            switch (ex)
+            {
+                case ValidationError ve:
+                    logger.LogWarning("Validation error on {Model}: {Message}", req.Model, ve.Message);
+                    return BadRequest(new { error = ve.Message });
+                case UserError ue:
+                    logger.LogWarning("User error on {Model}: {Message}", req.Model, ue.Message);
+                    return UnprocessableEntity(new { error = ue.Message });
+                case AccessError ae:
+                    logger.LogWarning("Access denied on {Model}: {Message}", req.Model, ae.Message);
+                    return StatusCode(403, new { error = ae.Message });
+                case MissingError me:
+                    logger.LogWarning("Missing record on {Model}: {Message}", req.Model, me.Message);
+                    return NotFound(new { error = me.Message });
+                default:
+                    logger.LogError(ex, "RPC execution error on model {Model}, method {Method}", req.Model, req.Method);
+                    return StatusCode(500, new { error = ex.Message });
+            }
         }
     }
 }
