@@ -176,6 +176,11 @@ public class UniversalRpcController(
                     return Ok(new { value = models.ExecuteOnChange(req.Model, changedField, valuesMap) });
 
                 case "create":
+                    if (req.Args[0].ValueKind == JsonValueKind.Array)
+                    {
+                        var valuesList = req.Args[0].EnumerateArray().Select(DeserializeValues).ToList();
+                        return Ok(models.CreateMulti(req.Model, valuesList));
+                    }
                     var createValues = DeserializeValues(req.Args[0]);
                     return Ok(models.Create(req.Model, createValues));
 

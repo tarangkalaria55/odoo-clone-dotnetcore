@@ -150,6 +150,30 @@ in code too).
       out-of-scope list) exists, so a bootstrap path doesn't require
       already being admin.
 
+- [x] **Batch create** (`@api.model_create_multi`, `odoo/orm/decorators.py`)
+      — `ModelRegistry.CreateMulti` accepts a list of dicts, calling the
+      same `Create()` pipeline (validation/compute/constrain/many2many
+      sync) per row and returning a list of ids. `UniversalRpcController`'s
+      `create` case detects a JSON array vs. a single object in `args[0]`
+      and dispatches to `CreateMulti`/`Create` accordingly - the existing
+      single-record call shape is untouched.
+
+      Verified live: single `create` still works unchanged; batch `create`
+      with 3 rows returns `[id,id,id]` and all 3 exist; a batch with one
+      invalid row (missing required field) correctly 400s.
+
+      **Known gap, not fixed here**: `CreateMulti` isn't transactional.
+      Each `Create()` call opens and commits on its own connection (true
+      of every CRUD method in `ModelRegistry`, not just this one - there's
+      no ambient transaction anywhere in this engine), so when row *N* in
+      a batch fails, rows `1..N-1` stay committed instead of the whole
+      batch rolling back - confirmed live (a 2-row batch where row 2 failed
+      validation left row 1 committed; cleaned up manually after
+      verifying). Real atomicity means wrapping an entire RPC call in one
+      shared DB transaction across every `Create`/`Write`/`Unlink` it
+      touches - a much larger architectural change than batch create
+      itself, so deliberately not attempted in this pass.
+
 ## In progress / next up (priority order, core framework only)
 
 1. [ ] **X2many write-commands** (`odoo/orm/commands.py`, the
@@ -172,22 +196,27 @@ in code too).
        `Many2one` `ondelete=`) — `Unlink()` has no FK-safety net; deleting
        a referenced row either orphans child rows or throws a raw Postgres
        FK-violation exception instead of a friendly error / cascade.
-4. [ ] **Batch create** (`@api.model_create_multi`, `decorators.py`) —
-       `Create()` is single-record only; no list-of-dicts create path.
-5. [ ] **`_sql_constraints`** (`models.py` `_add_sql_constraints`) —
+4. [ ] **`_sql_constraints`** (`models.py` `_add_sql_constraints`) —
        declarative unique/check constraints with friendly error text
        instead of a raw Postgres unique-violation.
-6. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
+5. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
        `IOdooAddon` has no lifecycle callback beyond `RegisterModels` for
        one-time data seeding/migration on install or cleanup on uninstall.
-7. [ ] **`create_uid`/`write_uid`** (`models.py` `MetaModel`) — needs a
+6. [ ] **`create_uid`/`write_uid`** (`models.py` `MetaModel`) — needs a
        "current user" context threaded through `ModelRegistry` CRUD calls
        from `UniversalRpcController`'s `HttpContext.User`; same prerequisite
        as `sudo()`/superuser escalation (see out-of-scope section).
-8. [ ] **`any`/`not any` domain operator** — relational sub-domain
+7. [ ] **`any`/`not any` domain operator** — relational sub-domain
        matching, e.g. `[('invoice_line_ids','any',[('price_unit','>',100)])]`.
        Depends on #2 (domain tree) landing first. Lower priority than the
        above; genuinely needs a related-model subquery-style evaluation.
+8. [ ] **Transactional CRUD** (found while implementing batch create,
+       not in the original survey) — `ModelRegistry` has no ambient
+       transaction anywhere; every `Create`/`Write`/`Unlink` commits on
+       its own connection. Confirmed live: a failing batch `create` leaves
+       earlier rows in the batch committed. Real fix wraps a whole RPC
+       call in one shared transaction/connection — sizable, touches every
+       CRUD method, not scoped further here.
 
 ## Explicitly out of scope
 

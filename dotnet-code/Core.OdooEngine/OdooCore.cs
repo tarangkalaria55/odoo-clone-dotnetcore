@@ -724,6 +724,13 @@ public class ModelRegistry
         return newId;
     }
 
+    // Mirrors @api.model_create_multi (odoo/orm/decorators.py): create() accepts either a
+    // single dict or a list of dicts. Each row still goes through the same validation/compute/
+    // constrain pipeline as a lone Create() - this is just the batch entry point, not a bulk-
+    // insert fast path (no need for one here at this project's scale).
+    public List<int> CreateMulti(string model, List<Dictionary<string, object>> valuesList) =>
+        valuesList.Select(v => Create(model, v)).ToList();
+
     public bool Write(string model, int id, Dictionary<string, object> values)
     {
         EnsureModelExists(model);
