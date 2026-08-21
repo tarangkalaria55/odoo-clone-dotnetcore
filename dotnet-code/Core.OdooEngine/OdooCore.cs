@@ -562,39 +562,8 @@ public class ModelRegistry
 
         if (domain != null && domain.Count > 0)
         {
-            foreach (var clause in domain)
-            {
-                if (clause.Count < 3) continue;
-                var field = clause[0].ToString()!;
-                var op = clause[1].ToString()!;
-                var val = clause[2];
-
-                filtered = filtered.Where(r =>
-                {
-                    if (!r.TryGetValue(field, out var rVal) || rVal == null) return false;
-                    var rStr = rVal.ToString()!;
-                    switch (op)
-                    {
-                        case "=": return rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
-                        case "!=": return !rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
-                        case "like": return rStr.Contains(val?.ToString() ?? "", StringComparison.Ordinal);
-                        case "not like": return !rStr.Contains(val?.ToString() ?? "", StringComparison.Ordinal);
-                        case "ilike": return rStr.Contains(val?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
-                        case "not ilike": return !rStr.Contains(val?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
-                        case "=like": return rStr.Equals(val?.ToString(), StringComparison.Ordinal);
-                        case "not =like": return !rStr.Equals(val?.ToString(), StringComparison.Ordinal);
-                        case "=ilike": return rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
-                        case "not =ilike": return !rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
-                        case ">": return Convert.ToDouble(rVal) > Convert.ToDouble(val);
-                        case ">=": return Convert.ToDouble(rVal) >= Convert.ToDouble(val);
-                        case "<": return Convert.ToDouble(rVal) < Convert.ToDouble(val);
-                        case "<=": return Convert.ToDouble(rVal) <= Convert.ToDouble(val);
-                        case "in": return val is System.Collections.IEnumerable inList and not string && inList.Cast<object?>().Any(x => x?.ToString() == rStr);
-                        case "not in": return val is System.Collections.IEnumerable notInList and not string && !notInList.Cast<object?>().Any(x => x?.ToString() == rStr);
-                        default: return true;
-                    }
-                });
-            }
+            var predicate = ParseDomainPredicate(model, modelFields, domain);
+            filtered = filtered.Where(predicate);
         }
 
         // Odoo's active_test: rows with active=false are hidden unless the caller's domain
@@ -643,6 +612,126 @@ public class ModelRegistry
         }).ToList();
     }
 
+    // Odoo domains are prefix-notation: a flat list where '&'/'|'/'!' consume the following
+    // 1-2 terms (odoo/orm/domains.py). We keep SearchRead's `domain` parameter as
+    // List<List<object>> (not List<object>) specifically so every existing call site using a
+    // C# collection-expression literal like [["field","=",val]] keeps compiling unchanged -
+    // widening it was flagged as the risk that blocked this before. Instead, an operator is a
+    // single-element leaf: ["|"], ["&"], ["!"]. A domain with none of those (today's only shape)
+    // parses to exactly what it always meant: every leaf ANDed together.
+    private (Func<Dictionary<string, object>, bool> Pred, int Next) ParseDomainTerm(string model, Dictionary<string, FieldDef> modelFields, List<List<object>> domain, int i)
+    {
+        var token = domain[i];
+        if (token.Count == 1 && token[0] is string marker)
+        {
+            if (marker == "!")
+            {
+                var (child, next) = ParseDomainTerm(model, modelFields, domain, i + 1);
+                return (r => !child(r), next);
+            }
+            if (marker == "&" || marker == "|")
+            {
+                var (left, next1) = ParseDomainTerm(model, modelFields, domain, i + 1);
+                var (right, next2) = ParseDomainTerm(model, modelFields, domain, next1);
+                return (marker == "&" ? (r => left(r) && right(r)) : (r => left(r) || right(r)), next2);
+            }
+        }
+
+        var clause = token;
+        return (r => EvaluateLeaf(model, modelFields, clause, r), i + 1);
+    }
+
+    private Func<Dictionary<string, object>, bool> ParseDomainPredicate(string model, Dictionary<string, FieldDef> modelFields, List<List<object>> domain)
+    {
+        var terms = new List<Func<Dictionary<string, object>, bool>>();
+        var i = 0;
+        while (i < domain.Count)
+        {
+            var (term, next) = ParseDomainTerm(model, modelFields, domain, i);
+            terms.Add(term);
+            i = next;
+        }
+        return r => terms.All(t => t(r));
+    }
+
+    private bool EvaluateLeaf(string model, Dictionary<string, FieldDef> modelFields, List<object> clause, Dictionary<string, object> r)
+    {
+        if (clause.Count < 3) return true; // malformed/empty leaf - same no-op behavior as before
+        var field = clause[0].ToString()!;
+        var op = clause[1].ToString()!;
+        var val = clause[2];
+
+        if (op is "any" or "not any")
+        {
+            var matches = EvaluateAny(model, modelFields, field, val, r);
+            return op == "any" ? matches : !matches;
+        }
+
+        if (!r.TryGetValue(field, out var rVal) || rVal == null) return false;
+        var rStr = rVal.ToString()!;
+        switch (op)
+        {
+            case "=": return rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+            case "!=": return !rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+            case "like": return rStr.Contains(val?.ToString() ?? "", StringComparison.Ordinal);
+            case "not like": return !rStr.Contains(val?.ToString() ?? "", StringComparison.Ordinal);
+            case "ilike": return rStr.Contains(val?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
+            case "not ilike": return !rStr.Contains(val?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
+            case "=like": return rStr.Equals(val?.ToString(), StringComparison.Ordinal);
+            case "not =like": return !rStr.Equals(val?.ToString(), StringComparison.Ordinal);
+            case "=ilike": return rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+            case "not =ilike": return !rStr.Equals(val?.ToString(), StringComparison.OrdinalIgnoreCase);
+            case ">": return Convert.ToDouble(rVal) > Convert.ToDouble(val);
+            case ">=": return Convert.ToDouble(rVal) >= Convert.ToDouble(val);
+            case "<": return Convert.ToDouble(rVal) < Convert.ToDouble(val);
+            case "<=": return Convert.ToDouble(rVal) <= Convert.ToDouble(val);
+            case "in": return val is System.Collections.IEnumerable inList and not string && inList.Cast<object?>().Any(x => x?.ToString() == rStr);
+            case "not in": return val is System.Collections.IEnumerable notInList and not string && !notInList.Cast<object?>().Any(x => x?.ToString() == rStr);
+            default: return true;
+        }
+    }
+
+    // 'any'/'not any' (odoo/orm/domains.py): match if some related record (via a Many2one/
+    // One2many/Many2many field) satisfies a sub-domain. The sub-domain can itself use &/|/! -
+    // that's exactly why this needed the prefix-notation parser above to land first.
+    private bool EvaluateAny(string model, Dictionary<string, FieldDef> modelFields, string field, object? val, Dictionary<string, object> r)
+    {
+        if (!modelFields.TryGetValue(field, out var fdef) || fdef.Relation == null) return false;
+        var subDomain = ToSubDomain(val);
+
+        return fdef.Type switch
+        {
+            FieldType.Many2one when r.TryGetValue(field, out var mv) && mv != null =>
+                SearchRead(fdef.Relation, ["id"], WithExtraLeaf(["id", "=", Convert.ToInt32(mv)], subDomain)).Count > 0,
+            FieldType.One2many =>
+                SearchRead(fdef.Relation, ["id"], WithExtraLeaf([fdef.InverseName!, "=", Convert.ToInt32(r["id"])], subDomain)).Count > 0,
+            FieldType.Many2many => EvaluateManyToManyAny(model, field, fdef, Convert.ToInt32(r["id"]), subDomain),
+            _ => false
+        };
+    }
+
+    private bool EvaluateManyToManyAny(string model, string field, FieldDef fdef, int recordId, List<List<object>> subDomain)
+    {
+        var ids = GetMany2manyIds(model, field, fdef, recordId);
+        if (ids.Count == 0) return false;
+        return SearchRead(fdef.Relation!, ["id"], WithExtraLeaf(["id", "in", ids.Cast<object>().ToList()], subDomain)).Count > 0;
+    }
+
+    private static List<List<object>> WithExtraLeaf(List<object> leaf, List<List<object>> subDomain)
+    {
+        var combined = new List<List<object>> { leaf };
+        combined.AddRange(subDomain);
+        return combined;
+    }
+
+    // Mirrors DeserializeDomain's shape on the wire: a JSON array of arrays (leaves/operator
+    // markers), which UnwrapJson turns into nested object[] - reconstruct it as
+    // List<List<object>> so it can be parsed the same way as a top-level domain.
+    private static List<List<object>> ToSubDomain(object? val) =>
+        val is System.Collections.IEnumerable list and not string
+            ? list.Cast<object>().Select(item => item is System.Collections.IEnumerable inner and not string ? inner.Cast<object>().ToList() : new List<object> { item }).ToList()
+            : new List<List<object>>();
+
     // ModelRegistry is a DI singleton (shared across every concurrent request), so a
     // transaction can never be stored as instance state - that would let one request's rollback
     // affect another's in-flight writes. It's passed explicitly through each call instead.
@@ -674,15 +763,17 @@ public class ModelRegistry
         return (conn, true);
     }
 
-    private List<object[]> GetMany2manyValues(string model, string fieldName, FieldDef fdef, int recordId)
+    private List<int> GetMany2manyIds(string model, string fieldName, FieldDef fdef, int recordId)
     {
         var (joinTbl, colA, colB) = _db.ManyToManyTable(model, fieldName, fdef.Relation!);
-        List<int> ids;
-        using (var conn = _db.CreateConnection())
-        {
-            conn.Open();
-            ids = conn.Query<int>($"SELECT {_db.Quote(colB)} FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id = recordId }).ToList();
-        }
+        using var conn = _db.CreateConnection();
+        conn.Open();
+        return conn.Query<int>($"SELECT {_db.Quote(colB)} FROM {_db.Quote(joinTbl)} WHERE {_db.Quote(colA)} = @id", new { id = recordId }).ToList();
+    }
+
+    private List<object[]> GetMany2manyValues(string model, string fieldName, FieldDef fdef, int recordId)
+    {
+        var ids = GetMany2manyIds(model, fieldName, fdef, recordId);
         if (ids.Count == 0) return new();
 
         var related = SearchRead(fdef.Relation!, ["id", "name"], [["id", "in", ids.Cast<object>().ToList()]]);

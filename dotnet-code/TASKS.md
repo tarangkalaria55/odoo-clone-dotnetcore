@@ -241,6 +241,45 @@ in code too).
       (non-required) purchase order line's `lot_id` succeeded and left the
       line intact with `lot_id: null`.
 
+- [x] **OR/NOT domain grouping + `any`/`not any`** (`odoo/osv/expression.py`,
+      `odoo/orm/domains.py`) — implemented together since `any`'s
+      sub-domain argument can itself use `|`/`!`, so the grouping parser
+      had to land first regardless.
+
+      **How the earlier blocker got solved**: widening `SearchRead`'s
+      `domain` parameter from `List<List<object>>` to `List<object>` was
+      flagged as too risky (breaks every internal call site using a
+      collection-expression literal like `[["field","=",val]]`, since a
+      nested `[...]` can't target a bare `object` element type). Kept the
+      parameter type exactly as-is instead: an operator is now a
+      *single-element* leaf — `["|"]`, `["&"]`, `["!"]` — inside the same
+      flat `List<List<object>>`. Every existing call site (dozens of them)
+      compiles completely unchanged; only `SearchRead`'s own parsing
+      logic needed to change.
+
+      `ParseDomainTerm`/`ParseDomainPredicate` do the classic prefix-
+      notation reduction (`!` consumes 1 following term, `&`/`|` consume
+      2) into a composed `Func<Dictionary<string,object>,bool>` predicate;
+      a domain with no operators (every domain until now) parses to
+      exactly its old meaning, every leaf ANDed. The leaf switch itself
+      (`=`,`!=`,`like`,`in`,... ) is unchanged, just extracted into
+      `EvaluateLeaf`.
+
+      `any`/`not any` (`EvaluateAny`) handles all three relation kinds:
+      Many2one checks the referenced record; One2many checks its
+      `InverseName`-linked children; Many2many resolves join-table ids
+      first. Each builds `[id-filter, ...subDomain]` and reuses
+      `SearchRead` recursively — the sub-domain domain is a completely
+      normal domain, including further `any`/`|`/`!`.
+
+      Verified live against Postgres: implicit-AND backward compat
+      (existing 2-leaf domains, unchanged), explicit `|`, explicit `!`,
+      explicit `&`, `any` on Many2one/One2many/Many2many (including a
+      negative control that correctly returned `[]`), and `any` with an
+      `OR` sub-domain (`invoice_line_ids any [price_unit=10 | =999]`) —
+      the actual composed case that proves the dependency was real, not
+      just each piece working alone.
+
 ## In progress / next up (priority order, core framework only)
 
 1. [ ] **X2many write-commands** (`odoo/orm/commands.py`, the
@@ -248,24 +287,9 @@ in code too).
        `webclient.js` issues separate `create`/`write` calls per O2M line
        instead of one command list. Real behavior change, not just
        internals; needs a client + `Write`/`Create` change together.
-2. [ ] **OR/NOT domain grouping** (`odoo/osv/expression.py`, `odoo/orm/domains.py`
-       prefix notation: `['|', ('a','=',1), ('b','=',2)]`) — `SearchRead`'s
-       domain today only ANDs a flat list of leaves; there's no way to
-       express OR or a negated sub-group at all. Needs a small
-       recursive-descent parse of the prefix-notation list into a tree
-       before evaluating. **Deliberately not done this pass**: widening
-       `SearchRead`'s `domain` parameter from `List<List<object>>` to
-       `List<object>` risks breaking every existing call site that uses a
-       C# collection-expression literal (`[["field","=",val]]`) — needs a
-       careful, isolated pass with its own verification, not bundled into
-       a larger batch.
-3. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
+2. [ ] **`post_init_hook`/`uninstall_hook`** (`odoo/modules/loading.py`) —
        `IOdooAddon` has no lifecycle callback beyond `RegisterModels` for
        one-time data seeding/migration on install or cleanup on uninstall.
-4. [ ] **`any`/`not any` domain operator** — relational sub-domain
-       matching, e.g. `[('invoice_line_ids','any',[('price_unit','>',100)])]`.
-       Depends on #2 (domain tree) landing first. Lower priority than the
-       above; genuinely needs a related-model subquery-style evaluation.
 
 ## Done (continued)
 
